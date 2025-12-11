@@ -329,7 +329,10 @@ if __name__ == "__main__":
     parser.add_argument("--num_points", type=int, default=40000, help="Point Number [default: 40000]")
     parser.add_argument("--num_proposals", type=int, default=256, help="Proposal number [default: 256]")
     parser.add_argument("--num_scenes", type=int, default=-1, help="Number of scenes [default: -1]")
-    parser.add_argument("--seed", type=int, default=42, help="random seed")
+    parser.add_argument("--seed"
+                        
+                        
+                        , type=int, default=42, help="random seed")
     parser.add_argument("--coslr", action='store_true', help="cosine learning rate")
     parser.add_argument("--amsgrad", action='store_true', help="optimizer with amsgrad")
     parser.add_argument("--no_height", action="store_true", help="Do NOT use height signal in input.")
@@ -348,7 +351,7 @@ if __name__ == "__main__":
 
     # setting
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
     # reproducibility
     torch.manual_seed(args.seed)

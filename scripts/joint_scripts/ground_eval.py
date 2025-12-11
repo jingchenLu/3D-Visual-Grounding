@@ -17,7 +17,9 @@ from copy import deepcopy
 sys.path.append(os.path.join(os.getcwd())) # HACK add the root folder
 from lib.configs.config_joint import CONF
 from lib.joint.dataset import ScannetReferenceDataset
-from lib.joint.solver import Solver
+# 11月27日 注释
+from lib.joint.solver_3dvlp import Solver
+# from lib.joint.solver import Solver
 from lib.ap_helper.ap_helper_fcos import APCalculator, parse_predictions, parse_groundtruths
 from lib.loss_helper.loss_joint import get_joint_loss
 from lib.joint.eval_ground import get_eval
@@ -63,6 +65,7 @@ def get_model(args, DC, dataset):
         num_proposal=args.num_proposals,
         no_caption=True,
         use_topdown=False,
+        use_con=args.use_con,
         use_lang_classifier=(not args.no_lang_cls),
         use_bidir=args.use_bidir,
         dataset_config=DC
@@ -194,18 +197,34 @@ def eval_ref(args):
                     data["epoch"] = 0
                     data = model(data)
                     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                    # 11月9日注释修改
+                    # data = get_joint_loss(
+                    #     data_dict=data,
+                    #     device=device,
+                    #     config=DC,
+                    #     weights=0,
+                    #     detection=True,
+                    #     caption=False,
+                    #     reference=True, 
+                    #     use_lang_classifier=not args.no_lang_cls,
+                    #     orientation=False,
+                    #     distance=False,
+                    # )
                     data = get_joint_loss(
+                        args,
                         data_dict=data,
                         device=device,
                         config=DC,
                         weights=0,
+                        pad_token_id=0, 
                         detection=True,
                         caption=False,
-                        reference=True, 
+                        reference=True,
                         use_lang_classifier=not args.no_lang_cls,
                         orientation=False,
                         distance=False,
                     )
+
                     data = get_eval(
                         data_dict=data, 
                         config=DC,
@@ -495,6 +514,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_multiview", action="store_true", help="Use multiview images.")
     parser.add_argument("--use_bidir", action="store_true", help="Use bi-directional GRU.")
     parser.add_argument("--use_train", action="store_true", help="Use train split in evaluation.")
+    parser.add_argument("--use_con", action="store_true", help="Use contrastive losses / contrast module.")
+    parser.add_argument("--use_diou_loss", action="store_true", help="Use DIOU loss in grounding/detection.")
     parser.add_argument("--use_oracle", action="store_true", help="Use ground truth bounding boxes.")
     parser.add_argument("--use_cat_rand", action="store_true", help="Use randomly selected bounding boxes from correct categories as outputs.")
     parser.add_argument("--use_best", action="store_true", help="Use best bounding boxes as outputs.")
@@ -502,6 +523,10 @@ if __name__ == "__main__":
     parser.add_argument("--detection", action="store_true", help="evaluate the object detection results")
     args = parser.parse_args()
 
+    for _flag in ["use_reg_head","use_kl_loss","use_diou_loss","use_attr_loss",
+            "use_vote_weight","use_answer","use_mlm","debug"]:
+       if not hasattr(args, _flag):
+           setattr(args, _flag, False)
     assert args.lang_num_max == 1, 'lang max num == 1; avoid bugs'
     # setting
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
@@ -509,5 +534,5 @@ if __name__ == "__main__":
 
     # evaluate
     if args.reference: eval_ref(args)
-    if args.detection: eval_det(args)
+    # if args.detection: eval_det(args)
 

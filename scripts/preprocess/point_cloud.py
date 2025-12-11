@@ -22,10 +22,20 @@ def work(split, use_color=False, use_normal=True, use_multiview=True):
 
     dump_data = []
 
-    for scene_id in tqdm(scene_list[:10]):
+    # for scene_id in tqdm(scene_list[:10]):
+    for scene_id in tqdm(scene_list):
         # load scene data
         mesh_vertices = np.load(os.path.join(
             CONF.PATH.SCANNET_DATA, scene_id)+"_aligned_vert.npy")
+
+        # -------------------------- 新增：2. 先构造输出文件路径，判断是否已存在 --------------------------
+        preprocess_output_path = os.path.join(CONF.PATH.SCANNET_DATA, scene_id) + f"_preprocess_{split}.npy"
+        pcl_color_output_path = os.path.join(CONF.PATH.SCANNET_DATA, scene_id) + f"_pcl_color_{split}.npy"
+        
+        # 若两个输出文件都已存在，直接跳过后续处理和保存
+        if os.path.exists(preprocess_output_path) and os.path.exists(pcl_color_output_path):
+            print(f"提示：场景 {scene_id} 的输出文件已存在，跳过保存")
+            continue  # 跳过当前场景的保存逻辑，进入下一个循环
 
         # use color
         if not use_color:
@@ -48,11 +58,9 @@ def work(split, use_color=False, use_normal=True, use_multiview=True):
             
             dump_data.append(point_cloud.tolist())
 
-            np.save(os.path.join(CONF.PATH.SCANNET_DATA, scene_id) +
-                    "_preprocess_{}.npy".format(split), point_cloud)
-
-            np.save(os.path.join(CONF.PATH.SCANNET_DATA, scene_id) +
-                    "_pcl_color_{}.npy".format(split), pcl_color)
+        # -------------------------- 原代码：文件保存逻辑（保留不变，仅在输出文件不存在时执行） --------------------------
+        np.save(preprocess_output_path, point_cloud)
+        np.save(pcl_color_output_path, pcl_color)
     with open("dump.json", "w") as f:
         json.dump(dump_data, f)
 

@@ -7,7 +7,25 @@ import random
 
 
 class RelationModule(nn.Module):
-    def __init__(self, num_proposals=256, hidden_size=128, lang_num_size=300, det_channel=128, head=4, depth=2):
+    """
+    Geometry-aware object relation reasoning module.
+
+    - 使用改进的几何编码 (距离 / 高度差 / 尺寸差 / 尺寸比)，兼顾视角敏感和部分视角不变信息；
+    - 通过几何 MLP 生成 per-head attention bias，作为 MultiHeadAttention 的加性权重；
+    - 可选 kNN 稀疏图，减少远距离 proposal 之间的噪声关系；
+    - 融合 3D box embedding 和多视图 / RGB 对象特征 obj_embedding。
+    """
+
+    def __init__(
+        self,
+        num_proposals: int = 256,
+        hidden_size: int = 128,
+        lang_num_size: int = 300,   # 保留接口，当前实现未显式使用
+        det_channel: int = 128,
+        head: int = 4,
+        depth: int = 2,
+        k_neighbors: int = None      # 若为 None 或 >= num_proposals 则退化为全连接图
+    ):
         super().__init__()
         self.use_box_embedding = True
         self.use_dist_weight_matrix = True
@@ -15,91 +33,207 @@ class RelationModule(nn.Module):
 
         self.num_proposals = num_proposals
         self.hidden_size = hidden_size
+        self.head = head
         self.depth = depth
+        self.k_neighbors = k_neighbors
 
+        # 将 detection head 输出的 bbox feature 映射到 relation hidden space
         self.features_concat = nn.Sequential(
             nn.Conv1d(det_channel, hidden_size, 1),
             nn.BatchNorm1d(hidden_size),
             nn.PReLU(hidden_size),
             nn.Conv1d(hidden_size, hidden_size, 1),
         )
-        self.self_attn_fc = nn.ModuleList(
-            nn.Sequential(  # 4 128 256 4(head)
-                nn.Linear(4, 32),  # xyz, dist
-                nn.ReLU(),
-                nn.LayerNorm(32),
-                nn.Linear(32, 32),
-                nn.ReLU(),
-                nn.LayerNorm(32),
-                nn.Linear(32, 4)
-            ) for i in range(depth))
-        self.self_attn = nn.ModuleList(
-            MultiHeadAttention(d_model=hidden_size, d_k=hidden_size // head, d_v=hidden_size // head, h=head) for i in range(depth))
 
+        # 几何特征维度：
+        self.geom_dim = 13
+
+        # 几何 -> attention bias (per head)
+        self.self_attn_fc = nn.ModuleList(
+            nn.Sequential(
+                nn.Linear(self.geom_dim, 64),
+                nn.ReLU(inplace=True),
+                nn.LayerNorm(64),
+                nn.Linear(64, head)
+            ) for _ in range(depth)
+        )
+
+        # 关系 self-attention
+        self.self_attn = nn.ModuleList(
+            MultiHeadAttention(
+                d_model=hidden_size,
+                d_k=hidden_size // head,
+                d_v=hidden_size // head,
+                h=head
+            ) for _ in range(depth)
+        )
+
+        # 3D box embedding (center + 8 corner offset，共 27 维)
         self.bbox_embedding = nn.ModuleList(
-            nn.Linear(27, hidden_size) for i in range(depth))
+            nn.Linear(27, hidden_size) for _ in range(depth)
+        )
+
+        # 多视图 / RGB 对象特征 embedding（point_clouds 中的 128 维特征）
         self.obj_embedding = nn.ModuleList(
-            nn.Linear(128, hidden_size) for i in range(depth))
+            nn.Linear(128, hidden_size) for _ in range(depth)
+        )
+
 
     def _get_bbox_centers(self, corners):
-        # batch_size, num_proposals, 3
+        # 复用你原来的中心计算实现
         coord_min = torch.min(corners, dim=2)[0]
-        # batch_size, num_proposals, 3
         coord_max = torch.max(corners, dim=2)[0]
         return (coord_min + coord_max) / 2
+
+    def _build_relation_geom(self, centers: torch.Tensor, corners: torch.Tensor) -> torch.Tensor:
+        """
+        构建 proposal 之间的几何关系特征（包含 IoU / 双向包含率）
+
+        Args:
+            centers: (B, N, 3)  每个 proposal 的中心
+            corners: (B, N, 8, 3) 每个 proposal 的 8 个顶点
+
+        Returns:
+            geom: (B, N, N, 13)  每对 (i, j) proposal 的几何编码
+        """
+        B, N, _ = centers.shape
+        eps = 1e-6
+
+        # 1) 轴对齐包围盒 AABB：从 corners 计算 min/max 和 size
+        coord_min = corners.min(dim=2)[0]          # (B, N, 3)
+        coord_max = corners.max(dim=2)[0]          # (B, N, 3)
+        sizes = coord_max - coord_min              # (B, N, 3), 近似长宽高
+
+        # 2) 中心偏移（相对 & 绝对）
+        center_i = centers[:, :, None, :]          # (B, N, 1, 3)
+        center_j = centers[:, None, :, :]          # (B, 1, N, 3)
+        delta = center_j - center_i                # (B, N, N, 3)
+        abs_delta = delta.abs()                    # (B, N, N, 3)
+        dist = torch.norm(delta, dim=-1, keepdim=True)  # (B, N, N, 1)
+
+        # 3) 用场景尺度做一个归一化（防止绝对坐标范围太大）
+        scene_min = coord_min.min(dim=1, keepdim=True)[0]   # (B, 1, 3)
+        scene_max = coord_max.max(dim=1, keepdim=True)[0]   # (B, 1, 3)
+        scene_size = (scene_max - scene_min).clamp(min=eps)     # (B, 1, 3)
+        scene_size = scene_size.view(B, 1, 1, 3)                # 显式 reshape
+        norm_delta = delta / scene_size                         # (B, N, N, 3)
+
+        # 4) 尺寸比例（log 比例更稳定）
+        size_i = sizes[:, :, None, :]        # (B, N, 1, 3)
+        size_j = sizes[:, None, :, :]        # (B, 1, N, 3)
+        size_ratio = (size_j / (size_i + eps)).clamp(min=eps, max=10.0)  # (B, N, N, 3)
+        log_size_ratio = torch.log(size_ratio)                            # (B, N, N, 3)
+
+        # 5) 体积 + AABB 交并体积
+        vol_i = (size_i[..., 0] * size_i[..., 1] * size_i[..., 2]).clamp(min=eps)  # (B, N, 1)
+        vol_j = (size_j[..., 0] * size_j[..., 1] * size_j[..., 2]).clamp(min=eps)  # (B, 1, N)
+
+        min_i = coord_min[:, :, None, :]     # (B, N, 1, 3)
+        max_i = coord_max[:, :, None, :]
+        min_j = coord_min[:, None, :, :]     # (B, 1, N, 3)
+        max_j = coord_max[:, None, :, :]
+
+        inter_min = torch.max(min_i, min_j)               # (B, N, N, 3)
+        inter_max = torch.min(max_i, max_j)               # (B, N, N, 3)
+        inter_dims = (inter_max - inter_min).clamp(min=0) # (B, N, N, 3)
+        inter_vol = inter_dims[..., 0] * inter_dims[..., 1] * inter_dims[..., 2]  # (B, N, N)
+
+        union_vol = (vol_i + vol_j - inter_vol).clamp(min=eps)  # 广播到 (B, N, N)
+
+        # 6) IoU & 双向包含率
+        iou = (inter_vol / union_vol).unsqueeze(-1)              # (B, N, N, 1)
+
+        # i 被 j 覆盖多少（更像“i 嵌在 j 里多少”）
+        contain_i_in_j = (inter_vol / vol_i).clamp(max=1.0).unsqueeze(-1)  # (B, N, N, 1)
+
+        # j 有多少体积在 i 内（对“sink 在 counter 里面”这一类最有用）
+        contain_j_in_i = (inter_vol / vol_j).clamp(max=1.0).unsqueeze(-1)  # (B, N, N, 1)
+
+        # 7) 拼接几何特征
+        # 维度统计：
+        # norm_delta (3) + abs_delta (3) + dist (1) + log_size_ratio (3)
+        # + iou (1) + contain_i_in_j (1) + contain_j_in_i (1) = 13
+        geom = torch.cat([
+            norm_delta,        # 3
+            abs_delta,         # 3 -> 6
+            dist,              # 1 -> 7
+            log_size_ratio,    # 3 -> 10
+            iou,               # 1 -> 11
+            contain_i_in_j,    # 1 -> 12
+            contain_j_in_i,    # 1 -> 13
+        ], dim=-1)             # (B, N, N, 13)
+
+        return geom
 
     def forward(self, data_dict):
         """
         Args:
-            xyz: (B,K,3)
-            features: (B,C,K)
-        Returns:
-            scores: (B,num_proposal,2+3+NH*2+NS*4)
+            data_dict 需要包含:
+                - pred_bbox_feature: (B, C_det, N)
+                - pred_bbox_corner:  (B, N, 8, 3)
+                - point_clouds:      (B, P, 3 + feat)
+                - seed_inds:         (B, Ns)
+                - aggregated_vote_inds: (B, N)
         """
-        # object size embedding
-        features = data_dict['pred_bbox_feature'].permute(0, 2, 1)
-        # B, N = features.shape[:2]
-        features = self.features_concat(features).permute(0, 2, 1)
-        #features = features.permute(0, 2, 1)
-
+        # 1) proposal 粗特征 -> relation hidden space
+        features = data_dict["pred_bbox_feature"].permute(0, 2, 1)   # (B, N, C_det)
+        features = self.features_concat(features).permute(0, 2, 1)  # (B, N, hidden)
         batch_size, num_proposal = features.shape[:2]
-        # features = self.mhatt(features, features, features, proposal_masks)
+
+        corners = data_dict["pred_bbox_corner"]                        # (B, N, 8, 3)
+        centers = data_dict["pred_bbox_center"]                      # (B, N, 3)
+
+        # 2) 构造几何特征 & 可选 kNN mask
+        if self.use_dist_weight_matrix:
+            geom = self._build_relation_geom(centers, corners)         # (B, N, N, geom_dim)
+
+            if self.k_neighbors is not None and self.k_neighbors < num_proposal:
+                with torch.no_grad():
+                    # pairwise 距离用于 kNN
+                    pairwise_dist = torch.norm(
+                        centers[:, :, None, :] - centers[:, None, :, :],
+                        dim=-1
+                    )  # (B, N, N)
+                    knn_idx = torch.topk(
+                        pairwise_dist,
+                        k=self.k_neighbors,
+                        dim=-1,
+                        largest=False
+                    )[1]  # (B, N, K)
+
+                    # mask 初始化为极小值，表示 "不相连"
+                    mask = torch.ones_like(pairwise_dist) * -1e4       # (B, N, N)
+                    mask.scatter_(2, knn_idx, 0.0)                     # 仅保留 K 个最近邻
+                knn_mask = mask.unsqueeze(1)                           # (B, 1, N, N)
+            else:
+                knn_mask = None
+        else:
+            geom = None
+            knn_mask = None
+
+        dist_weights = None
+        attention_matrix_way = "mul"
+
+        # 3) 多层 relation reasoning
         for i in range(self.depth):
-            # relation emb
-            if self.use_dist_weight_matrix:
-                # Attention Weight
-                # objects_center = data_dict['center']
-                objects_center = data_dict['pred_bbox_corner'].mean(dim=-2)
-                N_K = objects_center.shape[1]
-                center_A = objects_center[:, None, :, :].repeat(1, N_K, 1, 1)
-                center_B = objects_center[:, :, None, :].repeat(1, 1, N_K, 1)
-                center_dist = (center_A - center_B)
-                dist = center_dist.pow(2)
-                # print(dist.shape, '<< dist shape', flush=True)
-                dist = torch.sqrt(torch.sum(dist, dim=-1))[:, None, :, :]
-                #dist_weights = 1 / (dist + 1e-2)
-                #norm = torch.sum(dist_weights, dim=2, keepdim=True)
-                #dist_weights = dist_weights / norm
+            # 3.1 几何 -> per-head attention bias
+            if self.use_dist_weight_matrix and geom is not None:
+                # (B, N, N, head)
+                attn_bias = self.self_attn_fc[i](geom.detach())
+                # -> (B, head, N, N)
+                dist_weights = attn_bias.permute(0, 3, 1, 2).contiguous()
 
-                #zeros = torch.zeros_like(dist_weights)
-                # dist_weights = torch.cat([dist_weights, -dist, zeros, zeros], dim=1).detach()
-                # dist_weights = torch.cat([-dist, -dist, -dist, dist_weights, dist_weights, zeros, zeros, zeros], dim=1).detach()
-                # dist_weights = torch.cat([-dist, -dist, -dist, zeros], dim=1).detach()
+                if knn_mask is not None:
+                    dist_weights = dist_weights + knn_mask
 
-                weights = torch.cat([center_dist, dist.permute(
-                    0, 2, 3, 1)], dim=-1).detach()  # K N N 4
-                dist_weights = self.self_attn_fc[i](
-                    weights).permute(0, 3, 1, 2)
-
-                attention_matrix_way = 'add'
+                attention_matrix_way = "add"
             else:
                 dist_weights = None
-                attention_matrix_way = 'mul'
+                attention_matrix_way = "mul"
 
-            # multiview/rgb feature embedding
+            # 3.2 多视图 / RGB 对象特征
             if self.use_obj_embedding:
-                obj_feat = data_dict["point_clouds"][...,
-                                                     6:6 + 128].permute(0, 2, 1)
+                obj_feat = data_dict["point_clouds"][..., 6:6 + 128].permute(0, 2, 1)
                 obj_feat_dim = obj_feat.shape[1]
                 obj_feat_id_seed = data_dict["seed_inds"]
                 obj_feat_id_seed = obj_feat_id_seed.long() + (
@@ -114,15 +248,13 @@ class RelationModule(nn.Module):
                 obj_feat = obj_feat.reshape(-1, obj_feat_dim)[obj_feat_id].reshape(batch_size, num_proposal,
                                                                                    obj_feat_dim)
                 obj_embedding = self.obj_embedding[i](obj_feat)
-                features = features + obj_embedding * 0.1
+                features = features + 0.1 * obj_embedding
 
-            # box embedding
+            # 3.3 box 几何 embedding (center + corner offset)
             if self.use_box_embedding:
-                corners = data_dict['pred_bbox_corner']
                 # batch_size, num_proposals, 3
                 centers = self._get_bbox_centers(corners)
                 num_proposals = centers.shape[1]
-                # attention weight
                 manual_bbox_feat = torch.cat(
                     [centers, (corners - centers[:, :, None, :]
                                ).reshape(batch_size, num_proposals, -1)],
@@ -130,10 +262,14 @@ class RelationModule(nn.Module):
                 bbox_embedding = self.bbox_embedding[i](manual_bbox_feat)
                 features = features + bbox_embedding
 
-            features = self.self_attn[i](features, features, features, attention_weights=dist_weights,
-                                         way=attention_matrix_way)
+            # 3.4 基于几何 bias 的 self-attention 更新关系特征
+            features = self.self_attn[i](
+                features, features, features,
+                attention_weights=dist_weights,
+                way=attention_matrix_way
+            )
 
-        data_dict['dist_weights'] = dist_weights
-        data_dict['attention_matrix_way'] = attention_matrix_way
+        data_dict["dist_weights"] = dist_weights
+        data_dict["attention_matrix_way"] = attention_matrix_way
         data_dict["bbox_feature"] = features
         return data_dict

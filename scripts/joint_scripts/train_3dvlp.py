@@ -1,9 +1,7 @@
-# coding=utf8
-# HACK ignore warnings
-# fmt: off
 import wandb
+import pandas as pd
 import numpy as np
-import torch
+
 import random
 import argparse
 import json
@@ -120,14 +118,15 @@ def get_model(args, dataset, device):
         print("pretrained_path", pretrained_path, flush=True)
         model.load_state_dict(torch.load(pretrained_path), strict=False)
 
-    # multi-GPU
-    if torch.cuda.device_count() > 1:
-        print("using {} GPUs...".format(torch.cuda.device_count()))
-        model = torch.nn.DataParallel(model)
+    # # multi-GPU
+    # if torch.cuda.device_count() > 1:
+    #     print("using {} GPUs...".format(torch.cuda.device_count()))
+    #     model = torch.nn.DataParallel(model)
 
     # to device
+    # model.to(device)
     model.to(device)
-
+    
     return model
 
 
@@ -140,6 +139,7 @@ def get_num_params(model):
 
 def get_solver(args, dataset, dataloader):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
     model = get_model(args, dataset["train"], device)
 
     weight_dict = {
@@ -156,6 +156,7 @@ def get_solver(args, dataset, dataloader):
     #optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
 
     checkpoint_best = None
+    start_epoch = 0  # <--- 新增：初始化 start_epoch
 
     if args.use_checkpoint:
         print("loading checkpoint {}...".format(args.use_checkpoint))
@@ -169,6 +170,11 @@ def get_solver(args, dataset, dataloader):
         model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         checkpoint_best = checkpoint["best"]
+
+        # <--- 新增：读取保存的 epoch 并 +1 作为新的起始点
+        if "epoch" in checkpoint:
+            start_epoch = checkpoint["epoch"] + 1
+            print(f"Resuming from epoch {start_epoch}...")
     else:
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         if args.tag:
@@ -177,6 +183,8 @@ def get_solver(args, dataset, dataloader):
         os.makedirs(root, exist_ok=True)
 
     # scheduler parameters for training solely the detection pipeline
+    # 学习率在第80、120、160个epoch衰减
+    # T_max 表示余弦退火学习率调度中一个完整余弦周期的长度
     LR_DECAY_STEP = [80, 120, 160] if args.no_caption else None
     if args.coslr:
         if args.epoch > 200:
@@ -191,8 +199,11 @@ def get_solver(args, dataset, dataloader):
                 'T_max': args.epoch,
                 'eta_min': 1e-5,
             }
+    # 学习率衰减率：不使用caption模块时设为0.1
     LR_DECAY_RATE = 0.1 if args.no_caption else None
+    # 批归一化衰减步长：不使用caption模块时每20个epoch衰减一次
     BN_DECAY_STEP = 20 if args.no_caption else None
+    # 不批归一化衰减率：使用caption模块时衰减率为0.5
     BN_DECAY_RATE = 0.5 if args.no_caption else None
 
     print('LR&BN_DECAY', LR_DECAY_STEP, LR_DECAY_RATE,
@@ -223,7 +234,7 @@ def get_solver(args, dataset, dataloader):
                     checkpoint_best=checkpoint_best)
     num_params = get_num_params(model)
 
-    return solver, num_params, root
+    return solver, num_params, root, start_epoch
 
 
 def save_info(args, root, num_params, dataset):
@@ -389,7 +400,162 @@ def get_scanrefer(args):
 
     return new_scanrefer_train, new_scanrefer_eval_train, new_scanrefer_eval_val, new_scanrefer_eval_val2, eval_ground_val, all_scene_list, scanrefer_train_new, scanrefer_eval_train_new, scanrefer_eval_val_new, scanrefer_eval_val_new2, eval_ground_new
 
+def get_referit3d(args):
+    # 1. 确定文件路径
+    # 假设数据存放在 CONF.PATH.DATA/ReferIt3D 下
+    base_csv_path = os.path.join(CONF.PATH.DATA, "ReferIt3D", f"{args.dataset}.csv")
+    scan_split_path = os.path.join(CONF.PATH.DATA, "meta_data")
+    
+    print(f"Loading ReferIt3D dataset: {args.dataset} from {base_csv_path}")
+    
+    # 读取 CSV
+    # joint_det_dataset.py 中使用 csv 读取，这里用 pandas 更方便
+    df = pd.read_csv(base_csv_path)
+    
+    # 2. 加载 Split 文件 (train/val scenes)
+    # 参考 joint_det_dataset.py 中 load_sr3d_annos 的逻辑
+    def load_scans(split_name):
+        # 兼容 sr3d_train_scans.txt 或 train_scans.txt 命名
+        f_paths = [
+            os.path.join(scan_split_path, f"{args.dataset}_{split_name}_scans.txt"),
+            os.path.join(scan_split_path, f"{split_name}_scans.txt")
+        ]
+        for p in f_paths:
+            if os.path.exists(p):
+                with open(p, "r") as f:
+                    # 文件内容通常是 python list 格式的字符串，如 "['scene0000_00', ...]"
+                    return set(eval(f.read()))
+        raise FileNotFoundError(f"Cannot find split file for {split_name} in {scan_split_path}")
 
+    train_scan_ids = load_scans("train")
+    # ReferIt3D 的验证集通常命名为 'test' 或 'val'，根据实际文件调整，这里默认读取 test split 作为 val
+    val_scan_ids = load_scans("test") 
+
+    # 3. 数据过滤与格式化
+    def process_data(target_scan_ids, is_train=True):
+        data_list = []
+        # 过滤 Scene
+        sub_df = df[df["scan_id"].isin(target_scan_ids)]
+        
+        # 过滤规则参考 joint_det_dataset.py
+        if args.dataset == "sr3d":
+            # SR3D: 过滤掉没有明确提及目标类别的样本
+            # 参考: str(line[headers['mentions_target_class']]).lower() == 'true'
+            sub_df = sub_df[sub_df["mentions_target_class"].astype(str).str.lower() == "true"]
+        elif args.dataset == "nr3d":
+            # NR3D: 训练时通常只使用 correct_guess 的样本，或者根据需求全用
+            # 参考: str(line[headers['correct_guess']]).lower() == 'true'
+            if is_train:
+                sub_df = sub_df[sub_df["correct_guess"].astype(str).str.lower() == "true"]
+        
+        for idx, row in sub_df.iterrows():
+            # 构造 ScanRefer 格式的字典
+            # joint_det_dataset.py 中读取了 scan_id, target_id, utterance
+            item = {
+                "scene_id": row["scan_id"],
+                "object_id": str(int(row["target_id"])),  # ScanRefer 通常用 string 格式 ID
+                "ann_id": str(idx),
+                "object_name": row["instance_type"],
+                # ScanRefer json 中的 token 是分词后的 list，这里简单 split
+                "token": str(row["utterance"]).strip().split(), 
+                "bbox": [] # ReferIt3D CSV 不含 bbox，依赖 dataset 类从点云加载
+            }
+            data_list.append(item)
+        return data_list
+
+    print("Processing train data...")
+    scanrefer_train = process_data(train_scan_ids, is_train=True)
+    print("Processing val data...")
+    scanrefer_eval_val = process_data(val_scan_ids, is_train=False)
+
+    # -------------------------------------------------------------------------
+    # 4. 数据分组 (Grouping)
+    # train_3dvlp.py 强依赖这种将同一场景数据打包的结构 (参考 get_scanrefer)
+    # -------------------------------------------------------------------------
+
+    # 必须按 scene_id 排序，否则后续分组逻辑会出错
+    scanrefer_train.sort(key=lambda x: x["scene_id"])
+    scanrefer_eval_val.sort(key=lambda x: x["scene_id"])
+
+    train_scene_list = sorted(list(set(d["scene_id"] for d in scanrefer_train)))
+    val_scene_list = sorted(list(set(d["scene_id"] for d in scanrefer_eval_val)))
+    all_scene_list = train_scene_list + val_scene_list
+
+    # --- Grouping Logic for Train ---
+    scanrefer_train_new = []
+    scanrefer_train_new_scene = []
+    scene_id = ""
+    for data in scanrefer_train:
+        if scene_id != data["scene_id"]:
+            scene_id = data["scene_id"]
+            if len(scanrefer_train_new_scene) > 0:
+                scanrefer_train_new.append(scanrefer_train_new_scene)
+            scanrefer_train_new_scene = []
+        # 限制最大语料数量
+        if len(scanrefer_train_new_scene) >= args.lang_num_max - args.lang_num_aug:
+            scanrefer_train_new.append(scanrefer_train_new_scene)
+            scanrefer_train_new_scene = []
+        scanrefer_train_new_scene.append(data)
+    if len(scanrefer_train_new_scene) > 0:
+        scanrefer_train_new.append(scanrefer_train_new_scene)
+
+    # --- Grouping Logic for Eval (Train) ---
+    # 原代码中逻辑：eval_train 只是用 train 的第一个样本复制填充，这里简化处理，尽量保持结构一致
+    scanrefer_eval_train = []
+    scanrefer_eval_train_new = []
+    # 这里的实现简单地取每个场景的一个样本进行评估，或者保持为空
+    for scene_id in train_scene_list:
+        # 找到该场景的第一个数据 (作为 dummy)
+        # 为了效率，这里不遍历整个列表，而是假设结构兼容
+        data = deepcopy(scanrefer_train[0]) 
+        data["scene_id"] = scene_id
+        scanrefer_eval_train.append(data)
+        
+        # 构建 lang_num_max 个重复数据
+        scene_chunk = [data] * args.lang_num_max
+        scanrefer_eval_train_new.append(scene_chunk)
+
+    # --- Grouping Logic for Eval (Val) ---
+    # 这里的逻辑与 Train 类似，但是是对 Val 数据
+    scanrefer_eval_val_new = []
+    scanrefer_eval_val_new_scene = []
+    scene_id = ""
+    for data in scanrefer_eval_val:
+        if scene_id != data["scene_id"]:
+            scene_id = data["scene_id"]
+            if len(scanrefer_eval_val_new_scene) > 0:
+                scanrefer_eval_val_new.append(scanrefer_eval_val_new_scene)
+            scanrefer_eval_val_new_scene = []
+        if len(scanrefer_eval_val_new_scene) >= args.lang_num_max:
+            scanrefer_eval_val_new.append(scanrefer_eval_val_new_scene)
+            scanrefer_eval_val_new_scene = []
+        scanrefer_eval_val_new_scene.append(data)
+    if len(scanrefer_eval_val_new_scene) > 0:
+        scanrefer_eval_val_new.append(scanrefer_eval_val_new_scene)
+
+    # --- Grouping Logic for Eval Val 2 (Per Scene) ---
+    # 原代码逻辑：new_scanrefer_eval_val2
+    scanrefer_eval_val2 = []
+    scanrefer_eval_val_new2 = []
+    for scene_id in val_scene_list:
+        data = deepcopy(scanrefer_eval_val[0])
+        data["scene_id"] = scene_id
+        scanrefer_eval_val2.append(data)
+        scene_chunk = [data] * args.lang_num_max
+        scanrefer_eval_val_new2.append(scene_chunk)
+
+    # --- Grouping Logic for Ground Eval ---
+    # 简单复用 eval_val 数据
+    eval_ground_val = scanrefer_eval_val
+    eval_ground_new = deepcopy(scanrefer_eval_val_new) # 简化，直接复用
+
+    print(f"Dataset {args.dataset} Loaded:")
+    print(f"Train samples: {len(scanrefer_train)} | Val samples: {len(scanrefer_eval_val)}")
+    print(f"Train batches (grouped): {len(scanrefer_train_new)}")
+
+    return (scanrefer_train, scanrefer_eval_train, scanrefer_eval_val, scanrefer_eval_val2, 
+            eval_ground_val, all_scene_list, scanrefer_train_new, scanrefer_eval_train_new, 
+            scanrefer_eval_val_new, scanrefer_eval_val_new2, eval_ground_new)
 def get_scanrefer_test(args):
     SCANREFER_TEST = json.load(
         open(os.path.join(CONF.PATH.DATA, "ScanRefer_filtered_test.json")))
@@ -439,6 +605,7 @@ def predict(args):
 
     # model
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
     model = get_model(args, dataset, device)
 
     # config
@@ -541,8 +708,16 @@ def predict(args):
 def train(args):
     # init training dataset
     print("preparing data...")
-    scanrefer_train, scanrefer_eval_train, scanrefer_eval_val, scanrefer_eval_val2, eval_ground_val, all_scene_list, scanrefer_train_new, scanrefer_eval_train_new, scanrefer_eval_val_new, scanrefer_eval_val_new2, eval_ground_new = get_scanrefer(
-        args)
+    # scanrefer_train, scanrefer_eval_train, scanrefer_eval_val, scanrefer_eval_val2, eval_ground_val, all_scene_list, scanrefer_train_new, scanrefer_eval_train_new, scanrefer_eval_val_new, scanrefer_eval_val_new2, eval_ground_new = get_scanrefer(
+    #     args)
+    # --- 修改开始 ---
+    if args.dataset == "ScanRefer":
+        scanrefer_train, scanrefer_eval_train, scanrefer_eval_val, scanrefer_eval_val2, eval_ground_val, all_scene_list, scanrefer_train_new, scanrefer_eval_train_new, scanrefer_eval_val_new, scanrefer_eval_val_new2, eval_ground_new = get_scanrefer(args)
+    elif args.dataset in ["sr3d", "nr3d"]:
+        scanrefer_train, scanrefer_eval_train, scanrefer_eval_val, scanrefer_eval_val2, eval_ground_val, all_scene_list, scanrefer_train_new, scanrefer_eval_train_new, scanrefer_eval_val_new, scanrefer_eval_val_new2, eval_ground_new = get_referit3d(args)
+    else:
+        raise ValueError(f"Invalid dataset: {args.dataset}")
+        
 
     # 注意：eval_train_dataset实际上没用
     # dataloader
@@ -578,11 +753,12 @@ def train(args):
     }
 
     print("initializing...")
-    solver, num_params, root = get_solver(args, dataset, dataloader)
+    solver, num_params, root, start_epoch = get_solver(args, dataset, dataloader)
 
     print("Start training...\n")
     save_info(args, root, num_params, dataset)
-    solver(args.epoch, args.verbose)
+    print(f"[{datetime.now()}] Solver created, start training loop...", flush=True)
+    solver(args.epoch, args.verbose, start_epoch=start_epoch)
 
 
 if __name__ == "__main__":
@@ -774,9 +950,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # # setting
-    # os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-
+    import torch
     # reproducibility
 
     torch.manual_seed(args.seed)
@@ -787,9 +963,9 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    wandb.init(project="3dvlp", entity="3dvlp", name="3dvlp")
-    wandb.define_metric("epoch")
-    wandb.define_metric("epoch/*", step_metric="epoch")
-    wandb.define_metric("iter")
-    wandb.define_metric("iter/*", step_metric="iter")
+    # wandb.init(project="3dvlp")
+    # wandb.define_metric("epoch")
+    # wandb.define_metric("epoch/*", step_metric="epoch")
+    # wandb.define_metric("iter")
+    # wandb.define_metric("iter/*", step_metric="iter")
     train(args)

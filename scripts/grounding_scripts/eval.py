@@ -17,7 +17,6 @@ from copy import deepcopy
 sys.path.append(os.path.join(os.getcwd())) # HACK add the root folder
 from lib.configs.config import CONF
 from lib.visual_grounding.dataset import ScannetReferenceDataset
-from lib.visual_grounding.solver_3dvlp_g import Solver
 from lib.ap_helper.ap_helper_fcos import APCalculator, parse_predictions, parse_groundtruths
 from lib.loss_helper.loss_grounding import get_loss
 from lib.visual_grounding.eval_helper import get_eval
@@ -482,7 +481,7 @@ if __name__ == "__main__":
     assert args.lang_num_max == 1, 'lang max num == 1; avoid bugs'
     # setting
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
     # evaluate
     if args.reference: eval_ref(args)

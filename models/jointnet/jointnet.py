@@ -90,6 +90,8 @@ class JointNet(nn.Module):
 
             self.positive_match = PositiveMatchModule()
 
+            # 目标级自对比学习模块（筛选正负样本，使正样本特征嵌入更接近）
+            # 跨对比对齐模块（）
             # --------- CONSTRAST LEARNING ---------
             if self.use_con:
                 self.constrast = ContrastModule(config=self.dataset_config)
@@ -152,7 +154,7 @@ class JointNet(nn.Module):
 
         # --------- PROPOSAL GENERATION ---------
         data_dict = self.proposal(xyz, features, data_dict)
-        data_dict = self.relation(data_dict)
+        
 
         if not self.no_reference:
             #######################################
@@ -161,6 +163,8 @@ class JointNet(nn.Module):
             #                                     #
             #######################################
             data_dict = self.lang(data_dict)
+            # --------- RELATION MODULE --------- 从proposal调整到lang之后
+            data_dict = self.relation(data_dict)
 
             #######################################
             #                                     #

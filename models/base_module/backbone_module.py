@@ -6,7 +6,7 @@ import sys
 import os
 
 from lib.pointnet2.pointnet2_modules import PointnetSAModuleVotes, PointnetFPModule
-
+from models.ISL.isl import ISL, knn
 
 class Pointnet2Backbone(nn.Module):
     r"""
@@ -122,6 +122,7 @@ class Pointnet2Backbone(nn.Module):
         data_dict['sa4_features'] = features
 
         # --------- 2 FEATURE UPSAMPLING LAYERS --------
+        # 将高层语义信息传递给低层几何细节
         # print("fp",data_dict['sa3_xyz'].shape,data_dict['sa4_xyz'].shape,data_dict['sa3_features'].shape,data_dict['sa4_features'].shape)
         features = self.fp1(data_dict['sa3_xyz'], data_dict['sa4_xyz'],
                             data_dict['sa3_features'], data_dict['sa4_features'])
@@ -132,6 +133,7 @@ class Pointnet2Backbone(nn.Module):
         num_seed = data_dict['fp2_xyz'].shape[1]
         # indices among the entire input point clouds
         data_dict['fp2_inds'] = data_dict['sa1_inds'][:, 0:num_seed]
+
         return data_dict
 
 

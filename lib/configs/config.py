@@ -8,7 +8,7 @@ CONF = EasyDict()
 
 # path
 CONF.PATH = EasyDict()
-CONF.PATH.BASE = '/data/zhangtaolin/data/ScanQa'
+CONF.PATH.BASE = '/home/ljc/work/3DVLP'
 CONF.PATH.CLUSTER = "" # TODO: change this
 CONF.PATH.DATA = os.path.join(CONF.PATH.BASE, "data")
 CONF.PATH.SCANNET = os.path.join(CONF.PATH.DATA, "scannet")
@@ -31,18 +31,22 @@ CONF.PATH.SCANNET_DATA = os.path.join(CONF.PATH.SCANNET, "scannet_data")
 CONF.PATH.SCAN2CAD = os.path.join(CONF.PATH.DATA, "Scan2CAD_dataset") # TODO change this
 
 # data
-CONF.SCANNET_DIR =  CONF.PATH.DATA + "/scannet/scans" # TODO change this
-CONF.SCANNET_FRAMES_ROOT = CONF.PATH.DATA + "/frames_square/" # TODO change this
-CONF.PROJECTION = CONF.PATH.DATA + "/multiview_projection_scanrefer" # TODO change this
-CONF.ENET_FEATURES_ROOT = CONF.PATH.DATA + "/enet_features" # TODO change this
+# CONF.SCANNET_DIR =  CONF.PATH.DATA + "/scannet/scans" # TODO change this
+CONF.SCANNET_DIR = CONF.PATH.SCANNET_SCANS
+# CONF.SCANNET_FRAMES_ROOT = CONF.PATH.DATA + "/frames_square/" # TODO change this
+CONF.SCANNET_FRAMES_ROOT = os.path.join(CONF.PATH.SCANNET, "frames_square")
+# CONF.PROJECTION = CONF.PATH.DATA + "/multiview_projection_scanrefer" # TODO change this
+CONF.PROJECTION = os.path.join(CONF.PATH.DATA, "multiview_projection_scanrefer")
+# CONF.ENET_FEATURES_ROOT = CONF.PATH.DATA + "/enet_features" # TODO change this
+CONF.ENET_FEATURES_ROOT = os.path.join(CONF.PATH.DATA, "enet_features")
 
 CONF.ENET_FEATURES_SUBROOT = os.path.join(CONF.ENET_FEATURES_ROOT, "{}") # scene_id
 CONF.ENET_FEATURES_PATH = os.path.join(CONF.ENET_FEATURES_SUBROOT, "{}.npy") # frame_id
 CONF.SCANNET_FRAMES = os.path.join(CONF.SCANNET_FRAMES_ROOT, "{}/{}") # scene_id, mode
 # CONF.SCENE_NAMES = sorted(os.listdir(CONF.SCANNET_DIR))
 CONF.ENET_WEIGHTS = os.path.join(CONF.PATH.BASE, "data/scannetv2_enet.pth")
-# CONF.MULTIVIEW = os.path.join(CONF.PATH.SCANNET_DATA, "enet_feats.hdf5")
-CONF.MULTIVIEW = os.path.join(CONF.PATH.SCANNET_DATA, "enet_feats_maxpool.hdf5")
+CONF.MULTIVIEW = os.path.join(CONF.PATH.SCANNET_DATA, "enet_feats.hdf5")
+# CONF.MULTIVIEW = os.path.join(CONF.PATH.SCANNET_DATA, "enet_feats_maxpool.hdf5") 刚刚注释
 CONF.NYU40_LABELS = os.path.join(CONF.PATH.SCANNET_META, "nyu40_labels.csv")
 
 # scannet

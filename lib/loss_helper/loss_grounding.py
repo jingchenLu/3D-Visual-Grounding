@@ -13,7 +13,7 @@ import torch_scatter
 # sys.path.append(os.path.join(os.getcwd(), "lib")) # HACK add the lib folder
 from utils.nn_distance import nn_distance, huber_loss
 from .loss import SoftmaxRankingLoss
-from utils.box_util import get_3d_box, get_3d_box_batch, box3d_iou, box3d_iou_batch, box3d_diou_batch_tensor
+from utils.box_util import get_3d_box, get_3d_box_batch, box3d_iou, box3d_iou_batch, box3d_diou_batch_tensor, box3d_ciou_batch_tensor
 from utils.box_util import rotz_batch_pytorch
 from .loss_detection import compute_vote_loss, compute_objectness_loss, compute_box_loss, compute_box_and_sem_cls_loss
 
@@ -223,11 +223,20 @@ def compute_diou_loss(data_dict, config, no_reference=False, use_reg_head=False,
                     num_proposals, 1)
 
                 if use_reg_head:
-                    ious, dious = box3d_diou_batch_tensor(
-                        pred_center_batch+pred_center_reg_batch[j], pred_box_size_batch+pred_box_size_reg_batch[j], gt_box_center_batch, gt_box_size_batch)
+                    # ious, dious = box3d_diou_batch_tensor(
+                    #     pred_center_batch+pred_center_reg_batch[j], pred_box_size_batch+pred_box_size_reg_batch[j], gt_box_center_batch, gt_box_size_batch)
+                    ious, dious = box3d_ciou_batch_tensor(
+                        pred_center_batch + pred_center_reg_batch[j],
+                        pred_box_size_batch + pred_box_size_reg_batch[j],
+                        gt_box_center_batch, gt_box_size_batch
+                    )
                 else:
-                    ious, dious = box3d_diou_batch_tensor(
-                        pred_center_batch, pred_box_size_batch, gt_box_center_batch, gt_box_size_batch)
+                    # ious, dious = box3d_diou_batch_tensor(
+                    #     pred_center_batch, pred_box_size_batch, gt_box_center_batch, gt_box_size_batch)
+                    ious, dious = box3d_ciou_batch_tensor(
+                        pred_center_batch, pred_box_size_batch,
+                        gt_box_center_batch, gt_box_size_batch
+                    )
                 ious_np = ious.detach()
                 dious_labels.append(dious)
                 # ious = torch.pow(ious, 0.5)

@@ -12,6 +12,7 @@ import torch
 
 import numpy as np
 from scipy.spatial import ConvexHull
+import math
 
 def polygon_clip(subjectPolygon, clipPolygon):
    """ Clip a polygon with another polygon.
@@ -527,3 +528,100 @@ def box3d_diou_batch_tensor(center1, size1, center2,size2):
     diou = iou - 1.5*(inter_diag)/outer_diag
     diou = torch.clamp(diou, min=-1, max=1)
     return iou, diou
+
+
+def box3d_ciou_batch_tensor(center1, size1, center2, size2,
+                            diou_scale: float = 1.0,
+                            max_ratio: float = 10.0,
+                            eps: float = 1e-7):
+    """
+    3D CIoU 版本（与 box3d_diou_batch_tensor 接口一致）
+
+    Args:
+        center1, center2: (N, 3)
+        size1, size2:     (N, 3)  [l, w, h]
+        diou_scale:       中心距离项的系数（建议 1.0）
+        max_ratio:        w/h, l/h 的最大截断值，防止极端比值导致数值不稳定
+    Returns:
+        iou:  (N,)
+        ciou: (N,)
+    """
+
+    # 拆中心
+    cx1, cy1, cz1 = center1[:, 0], center1[:, 1], center1[:, 2]
+    cx2, cy2, cz2 = center2[:, 0], center2[:, 1], center2[:, 2]
+
+    # 拆尺寸
+    l1, w1, h1 = size1[:, 0], size1[:, 1], size1[:, 2]
+    l2, w2, h2 = size2[:, 0], size2[:, 1], size2[:, 2]
+
+    # 体积
+    vol1 = l1 * w1 * h1
+    vol2 = l2 * w2 * h2
+
+    # 交集 AABB
+    inter_xA = torch.max(cx1 - l1 / 2, cx2 - l2 / 2)
+    inter_xB = torch.min(cx1 + l1 / 2, cx2 + l2 / 2)
+    inter_yA = torch.max(cy1 - w1 / 2, cy2 - w2 / 2)
+    inter_yB = torch.min(cy1 + w1 / 2, cy2 + w2 / 2)
+    inter_zA = torch.max(cz1 - h1 / 2, cz2 - h2 / 2)
+    inter_zB = torch.min(cz1 + h1 / 2, cz2 + h2 / 2)
+
+    inter_vol = (
+        torch.clamp(inter_xB - inter_xA, min=0) *
+        torch.clamp(inter_yB - inter_yA, min=0) *
+        torch.clamp(inter_zB - inter_zA, min=0)
+    )
+
+    union = vol1 + vol2 - inter_vol + eps
+    iou = inter_vol / union  # (N,)
+
+    # -------- 中心距离项（DIoU 部分），系数用 diou_scale（默认 1.0） --------
+    center_dist2 = (cx1 - cx2) ** 2 + (cy1 - cy2) ** 2 + (cz1 - cz2) ** 2
+
+    outer_xA = torch.min(cx1 - l1 / 2, cx2 - l2 / 2)
+    outer_xB = torch.max(cx1 + l1 / 2, cx2 + l2 / 2)
+    outer_yA = torch.min(cy1 - w1 / 2, cy2 - w2 / 2)
+    outer_yB = torch.max(cy1 + w1 / 2, cy2 + w2 / 2)
+    outer_zA = torch.min(cz1 - h1 / 2, cz2 - h2 / 2)
+    outer_zB = torch.max(cz1 + h1 / 2, cz2 + h2 / 2)
+
+    outer_diag2 = (
+        torch.clamp(outer_xB - outer_xA, min=0) ** 2 +
+        torch.clamp(outer_yB - outer_yA, min=0) ** 2 +
+        torch.clamp(outer_zB - outer_zA, min=0) ** 2
+    ) + eps
+
+    diou_term = diou_scale * (center_dist2 / outer_diag2)  # (N,)
+
+# -------- 3D 扁平性 / 形状一致性项 v (改进版) --------
+    # 策略：始终计算 "小 / 大" 的比值，确保值域在 (0, 1] 之间
+    # 这样既避免了数值爆炸（不需要 clamp max），又让 atan 处于梯度敏感区
+    # 我们约束三个截面的形状：l/w, w/h, h/l
+    
+    # 1. Width vs Height
+    v_wh_pred = torch.atan(torch.min(w1, h1) / (torch.max(w1, h1) + eps))
+    v_wh_gt   = torch.atan(torch.min(w2, h2) / (torch.max(w2, h2) + eps))
+    
+    # 2. Length vs Height (解决窗帘/画框的厚度问题)
+    v_lh_pred = torch.atan(torch.min(l1, h1) / (torch.max(l1, h1) + eps))
+    v_lh_gt   = torch.atan(torch.min(l2, h2) / (torch.max(l2, h2) + eps))
+    
+    # 3. Length vs Width (解决俯视图形状)
+    v_lw_pred = torch.atan(torch.min(l1, w1) / (torch.max(l1, w1) + eps))
+    v_lw_gt   = torch.atan(torch.min(l2, w2) / (torch.max(l2, w2) + eps))
+
+    # 3D 版本的 v：三个截面的一致性
+    # 系数 4/pi^2 是归一化系数，保持和原论文量级一致
+    pi2 = math.pi ** 2
+    v = (4.0 / pi2) * ((v_wh_pred - v_wh_gt)**2 + (v_lh_pred - v_lh_gt)**2 + (v_lw_pred - v_lw_gt)**2)
+    
+    # -------- α：长宽比项的自适应权重，建议不传梯度 --------
+    with torch.no_grad():
+        alpha = v / (1.0 - iou + v + eps)
+
+    # -------- 最终 CIoU 分数（越大越好） --------
+    ciou = iou - diou_term - alpha * v
+    ciou = torch.clamp(ciou, min=-1.0, max=1.0)
+
+    return iou, ciou

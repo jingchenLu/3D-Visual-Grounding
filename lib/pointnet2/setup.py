@@ -24,7 +24,15 @@ setup(
             sources=_ext_sources,
             extra_compile_args={
                 "cxx": ["-O2", headers],
-                "nvcc": ["-O2", headers]
+                "nvcc": [
+                    "-O2",
+                    headers,
+                    "-gencode=arch=compute_70,code=sm_70",
+                    "-gencode=arch=compute_75,code=sm_75",
+                    "-gencode=arch=compute_80,code=sm_80",
+                    "-gencode=arch=compute_86,code=sm_86",
+                    "-gencode=arch=compute_89,code=sm_89",  # ✅ 关键：RTX 4090 支持
+                ]
             },
         )
     ],

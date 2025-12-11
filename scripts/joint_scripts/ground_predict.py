@@ -17,8 +17,7 @@ from copy import deepcopy
 sys.path.append(os.path.join(os.getcwd())) # HACK add the root folder
 from lib.configs.config_joint import CONF
 from lib.joint.dataset import ScannetReferenceDataset
-from lib.joint.solver import Solver
-from lib.ap_helper.ap_helper import APCalculator, parse_predictions, parse_groundtruths
+from lib.joint.solver_3dvlp import Solver
 from lib.loss_helper.loss_joint import get_joint_loss
 from lib.joint.eval_ground import get_eval
 from utils.box_util import get_3d_box

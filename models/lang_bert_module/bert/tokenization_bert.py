@@ -186,6 +186,8 @@ class BertTokenizer(PreTrainedTokenizer):
             strip_accents=strip_accents,
             **kwargs,
         )
+        # 11月6日 注释
+        # self.vocab = self.get_vocab()
 
         if not os.path.isfile(vocab_file):
             raise ValueError(

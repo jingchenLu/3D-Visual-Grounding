@@ -171,9 +171,11 @@ def get_joint_loss(args, data_dict, device, config, weights, pad_token_id,
         if distance:
             loss += 0.1*data_dict["dist_loss"]
         if reference:
+            # 11月26日 从0.3改为0.5
             if data_dict["epoch"] < 50:
                 loss += 0.3*data_dict["ref_loss"]
             else:
+                # 11月26日 从1改为1.5
                 loss += data_dict["ref_loss"]
         if args.use_diou_loss:
             loss += 0.3*data_dict["diou_loss"]

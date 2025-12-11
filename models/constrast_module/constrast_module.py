@@ -102,20 +102,26 @@ class ContrastModule(nn.Module):
                     gt_box_batch = create_box_batch(
                         gt_box_center_batch, gt_box_size_batch+1e-2)
                     try:
+                        # 计算 Ground Truth 和预测的 box 之间的重叠度
                         _, ious = box3d_overlap(
                             gt_box_batch, box_batch, eps=1e-7)  # 1, 256
                         ious = ious.view(-1)  # 256
                         target_mask_lang = (
                             ious > 0.25).float().unsqueeze(0).detach()
+                        # 归一化语言特征和点云特征
                         text_feat_norm_lang = F.normalize(
                             self.text_proj(lang_emb_batch), dim=-1)
                         box_feat_norm_lang = F.normalize(
                             self.pc_proj(features_batch), dim=-1)
+                        # 计算相似度矩阵
                         sim_lang = torch.mm(
                             text_feat_norm_lang, box_feat_norm_lang.t())  # 1,256
+                        # 计算语言特征与点云特征之间的对比损失
                         lang_con_loss += self.nce_loss(sim_lang, target_mask_lang)
 
+                        # 计算目标物体与预测框之间的 IoU，构建目标级 IoU 掩码
                         target_mask_iou = (ious > 0.25).float().detach()
+                        # 归一化点云特征并计算目标级 IoU 特征之间的相似度
                         target_mask_iou = target_mask_iou.unsqueeze(0).repeat(object_cnt,1)*target_mask_iou.unsqueeze(1).repeat(1,object_cnt).detach()
                         box_feat_norm_iou = F.normalize(self.pc_proj_iou(features_batch),dim=-1)
                         sim_iou = torch.mm(

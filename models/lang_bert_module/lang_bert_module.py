@@ -32,6 +32,7 @@ class LangBertModule(nn.Module):
                 CONF.DISTILBERT_TEXT_ENCODER, config=self.bert_config)
         else:
             self.bert_config = BertConfig.from_json_file(CONF.BERT_CONFIG)
+            # self.bert_config = BertConfig.from_pretrained("bert-base-uncased")
             self.tokenizer = BertTokenizer.from_pretrained(
                 CONF.BERT_TEXT_ENCODER)
             self.text_encoder = BertForMaskedLM.from_pretrained(

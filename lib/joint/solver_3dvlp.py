@@ -270,7 +270,7 @@ class Solver():
         else:
             self.bn_scheduler = None
 
-    def __call__(self, epoch, verbose):
+    def __call__(self, epoch, verbose, start_epoch=0):
         # setting
         self.epoch = epoch
         self.verbose = verbose
@@ -278,7 +278,14 @@ class Solver():
         self._total_iter["val"] = (len(self.dataloader["eval"]["train"]) + len(self.dataloader["eval"]["val"])) \
             * (self._total_iter["train"] / self.val_step)
 
-        for epoch_id in range(epoch):
+        # <--- 新增：如果从断点恢复，需要手动更新全局迭代器 _global_iter_id
+        # 否则 Tensorboard 的横坐标会从 0 开始覆盖之前的记录
+        if start_epoch > 0:
+            self._global_iter_id = start_epoch * len(self.dataloader["train"])
+            print(f"Resuming global iter from {self._global_iter_id}")
+
+        # <--- 修改：循环范围从 range(epoch) 改为 range(start_epoch, epoch)
+        for epoch_id in range(start_epoch, epoch):
             torch.cuda.empty_cache()
             try:
                 self._log("epoch {} starting...".format(epoch_id + 1))
@@ -562,7 +569,7 @@ class Solver():
                 "iter": self._global_iter_id + 1,
             }
 
-        wandb.log(data)
+        # wandb.log(data)
 
     def _set_phase(self, phase):
         if phase == "train":

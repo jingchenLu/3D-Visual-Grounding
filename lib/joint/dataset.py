@@ -360,7 +360,7 @@ class ReferenceDataset(Dataset):
     def _load_data(self, dataset_name):
         print("loading data...")
         # load language features
-        # self.glove = pickle.load(open(GLOVE_PICKLE, "rb"))
+        self.glove = pickle.load(open(GLOVE_PICKLE, "rb"))
         self._build_vocabulary(dataset_name)
         self.num_vocabs = len(self.vocabulary["word2idx"].keys())
         self.raw2label = self._get_raw2label()
@@ -894,7 +894,9 @@ class ScannetReferenceDataset(ReferenceDataset):
         data_dict["object_cat_list"] = np.array(
             object_cat_list).astype(np.int64)
 
-        data_dict["contrast_mask"] = np.array(contrast_mask).astype(np.bool)
+        # 11月3日 新增
+        # data_dict["contrast_mask"] = np.array(contrast_mask).astype(np.bool)
+        data_dict["contrast_mask"] = np.array(contrast_mask).astype(bool)
 
         bert_input = self.tokenizer(
             bert_text_list, padding='max_length', truncation=True, max_length=CONF.BERT_MAX_LEN, return_tensors="pt")
