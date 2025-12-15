@@ -181,7 +181,7 @@ class RelationModule(nn.Module):
         batch_size, num_proposal = features.shape[:2]
 
         corners = data_dict["pred_bbox_corner"]                        # (B, N, 8, 3)
-        centers = data_dict["pred_bbox_center"]                      # (B, N, 3)
+        centers = corners.mean(dim=2)                      # (B, N, 3)
 
         # 2) 构造几何特征 & 可选 kNN mask
         if self.use_dist_weight_matrix:

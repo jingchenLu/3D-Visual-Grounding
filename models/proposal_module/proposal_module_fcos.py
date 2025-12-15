@@ -129,14 +129,14 @@ class ProposalModule(nn.Module):
         pred_bboxes = torch.from_numpy(pred_bboxes).float().to(
             pred_center.device)  # .reshape(bsize, num_proposal, 8, 3)
         data_dict['pred_bbox_corner'] = pred_bboxes
-        # 11月29日新增，计算bbox center用于后续模块
-        corners = data_dict['pred_bbox_corner']          # (B, N, 8, 3)
-        coord_min = corners.min(dim=2)[0]               # (B, N, 3)
-        coord_max = corners.max(dim=2)[0]               # (B, N, 3)
-        pred_bbox_center = (coord_min + coord_max) / 2  # (B, N, 3)
+        # # 11月29日新增，计算bbox center用于后续模块
+        # corners = data_dict['pred_bbox_corner']          # (B, N, 8, 3)
+        # coord_min = corners.min(dim=2)[0]               # (B, N, 3)
+        # coord_max = corners.max(dim=2)[0]               # (B, N, 3)
+        # pred_bbox_center = (coord_min + coord_max) / 2  # (B, N, 3)
 
-        data_dict["center"] = pred_bbox_center
-        data_dict["pred_bbox_center"] = pred_bbox_center
+        # data_dict["center"] = pred_bbox_center
+        # data_dict["pred_bbox_center"] = pred_bbox_center
 
 
         # Testing Scripts

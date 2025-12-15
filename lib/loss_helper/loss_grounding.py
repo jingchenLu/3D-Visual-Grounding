@@ -223,20 +223,21 @@ def compute_diou_loss(data_dict, config, no_reference=False, use_reg_head=False,
                     num_proposals, 1)
 
                 if use_reg_head:
-                    # ious, dious = box3d_diou_batch_tensor(
-                    #     pred_center_batch+pred_center_reg_batch[j], pred_box_size_batch+pred_box_size_reg_batch[j], gt_box_center_batch, gt_box_size_batch)
-                    ious, dious = box3d_ciou_batch_tensor(
-                        pred_center_batch + pred_center_reg_batch[j],
-                        pred_box_size_batch + pred_box_size_reg_batch[j],
-                        gt_box_center_batch, gt_box_size_batch
-                    )
+                    ious, dious = box3d_diou_batch_tensor(
+                        pred_center_batch+pred_center_reg_batch[j], pred_box_size_batch+pred_box_size_reg_batch[j], gt_box_center_batch, gt_box_size_batch)
+                    # 12月12日 替换CIOU
+                    # ious, dious = box3d_ciou_batch_tensor(
+                    #     pred_center_batch + pred_center_reg_batch[j],
+                    #     pred_box_size_batch + pred_box_size_reg_batch[j],
+                    #     gt_box_center_batch, gt_box_size_batch
+                    # )
                 else:
-                    # ious, dious = box3d_diou_batch_tensor(
-                    #     pred_center_batch, pred_box_size_batch, gt_box_center_batch, gt_box_size_batch)
-                    ious, dious = box3d_ciou_batch_tensor(
-                        pred_center_batch, pred_box_size_batch,
-                        gt_box_center_batch, gt_box_size_batch
-                    )
+                    ious, dious = box3d_diou_batch_tensor(
+                        pred_center_batch, pred_box_size_batch, gt_box_center_batch, gt_box_size_batch)
+                    # ious, dious = box3d_ciou_batch_tensor(
+                    #     pred_center_batch, pred_box_size_batch,
+                    #     gt_box_center_batch, gt_box_size_batch
+                    # )
                 ious_np = ious.detach()
                 dious_labels.append(dious)
                 # ious = torch.pow(ious, 0.5)

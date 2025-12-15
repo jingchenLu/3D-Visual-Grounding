@@ -189,14 +189,19 @@ def eval_ref(args):
             lang_acc = []
             predictions = {}
             for data in tqdm(dataloader):
+                target_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
                 for key in data:
-                    data[key] = data[key].cuda()
+                    # data[key] = data[key].cuda()
+                    # 2. 修改这里：显式搬运到目标设备
+                    if isinstance(data[key], torch.Tensor):
+                        data[key] = data[key].to(target_device) # 替代 .cuda()
 
                 # feed
                 with torch.no_grad():
                     data["epoch"] = 0
                     data = model(data)
-                    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                    device = data['point_clouds'].device
+                    # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
                     # 11月9日注释修改
                     # data = get_joint_loss(
                     #     data_dict=data,
@@ -529,8 +534,9 @@ if __name__ == "__main__":
            setattr(args, _flag, False)
     assert args.lang_num_max == 1, 'lang max num == 1; avoid bugs'
     # setting
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    # os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 
     # evaluate
     if args.reference: eval_ref(args)
