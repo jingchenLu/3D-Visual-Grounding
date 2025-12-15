@@ -264,13 +264,25 @@ def get_scannet_scene_list(split):
 
 
 def get_scanrefer(args):
+    # 12月15日改：支持nr3d、sr3d数据集
     if args.dataset == "ScanRefer":
-        scanrefer_train = json.load(
-            open(os.path.join(CONF.PATH.DATA, "ScanRefer_filtered_train.json")))
-        scanrefer_eval_val = json.load(
-            open(os.path.join(CONF.PATH.DATA, "ScanRefer_filtered_val.json")))
+        train_file = "ScanRefer_filtered_train.json"
+        val_file   = "ScanRefer_filtered_val.json"
+        # scanrefer_train = json.load(
+        #     open(os.path.join(CONF.PATH.DATA, "ScanRefer_filtered_train.json")))
+        # scanrefer_eval_val = json.load(
+        #     open(os.path.join(CONF.PATH.DATA, "ScanRefer_filtered_val.json")))
+    elif args.dataset == "SR3D":
+        train_file = "SR3D_filtered_train.json"
+        val_file   = "SR3D_filtered_val.json"
+    elif args.dataset == "NR3D":
+        train_file = "NR3D_filtered_train.json"
+        val_file   = "NR3D_filtered_val.json"
     else:
         raise ValueError("Invalid dataset.")
+
+    scanrefer_train = json.load(open(os.path.join(CONF.PATH.DATA, train_file)))
+    scanrefer_eval_val = json.load(open(os.path.join(CONF.PATH.DATA, val_file)))
 
     if args.no_caption and args.no_reference:
         train_scene_list = get_scannet_scene_list("train")
