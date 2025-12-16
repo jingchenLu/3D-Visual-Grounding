@@ -918,7 +918,7 @@ class Solver():
                 for i in range(1,6):
                     self.log[phase][f"top_iou_rate_{i}"].append(
                     self._running_log[f"top_iou_rate_{i}"])
-                for i in range(1,6):
+                for i in range(1,18):
                     self.log[phase][f"class_iou_rate_{self.type2class[i]}"].append(
                     self._running_log[f"class_iou_rate_{self.type2class[i]}"])
                     self.log[phase][f"class_size_{self.type2class[i]}"].append(

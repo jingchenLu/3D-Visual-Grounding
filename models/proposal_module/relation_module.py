@@ -46,7 +46,9 @@ class RelationModule(nn.Module):
         )
 
         # 几何特征维度：
-        self.geom_dim = 13
+        # rel_vec(3) + dist(1) + horiz_dist(1) + cos_elev(1)
+        # + size_diff(3) + size_ratio(3) = 12
+        self.geom_dim = 12
 
         # 几何 -> attention bias (per head)
         self.self_attn_fc = nn.ModuleList(
@@ -78,6 +80,15 @@ class RelationModule(nn.Module):
             nn.Linear(128, hidden_size) for _ in range(depth)
         )
 
+    @staticmethod
+    def _get_bbox_centers(self, corners: torch.Tensor) -> torch.Tensor:
+        """
+        corners: (B, N, 8, 3)
+        return:  (B, N, 3)
+        """
+        coord_min = torch.min(corners, dim=2)[0]
+        coord_max = torch.max(corners, dim=2)[0]
+        return (coord_min + coord_max) / 2
 
     def _get_bbox_centers(self, corners):
         # 复用你原来的中心计算实现
@@ -87,81 +98,36 @@ class RelationModule(nn.Module):
 
     def _build_relation_geom(self, centers: torch.Tensor, corners: torch.Tensor) -> torch.Tensor:
         """
-        构建 proposal 之间的几何关系特征（包含 IoU / 双向包含率）
+        构造旋转部分不变 + 视角敏感混合的几何特征
 
-        Args:
-            centers: (B, N, 3)  每个 proposal 的中心
-            corners: (B, N, 8, 3) 每个 proposal 的 8 个顶点
-
-        Returns:
-            geom: (B, N, N, 13)  每对 (i, j) proposal 的几何编码
+        centers: (B, N, 3)
+        corners: (B, N, 8, 3)
+        return:  (B, N, N, geom_dim)
         """
         B, N, _ = centers.shape
-        eps = 1e-6
 
-        # 1) 轴对齐包围盒 AABB：从 corners 计算 min/max 和 size
-        coord_min = corners.min(dim=2)[0]          # (B, N, 3)
-        coord_max = corners.max(dim=2)[0]          # (B, N, 3)
-        sizes = coord_max - coord_min              # (B, N, 3), 近似长宽高
+        # pairwise center difference
+        center_i = centers[:, :, None, :]   # B, N, 1, 3
+        center_j = centers[:, None, :, :]   # B, 1, N, 3
+        rel_vec = center_j - center_i       # B, N, N, 3   (dx, dy, dz)
 
-        # 2) 中心偏移（相对 & 绝对）
-        center_i = centers[:, :, None, :]          # (B, N, 1, 3)
-        center_j = centers[:, None, :, :]          # (B, 1, N, 3)
-        delta = center_j - center_i                # (B, N, N, 3)
-        abs_delta = delta.abs()                    # (B, N, N, 3)
-        dist = torch.norm(delta, dim=-1, keepdim=True)  # (B, N, N, 1)
+        # 距离相关
+        dist = torch.norm(rel_vec, dim=-1, keepdim=True)                     # B, N, N, 1
+        horiz_dist = torch.norm(rel_vec[..., :2], dim=-1, keepdim=True)      # B, N, N, 1
+        delta_z = rel_vec[..., 2:3]                                          # B, N, N, 1
+        cos_elev = delta_z / (dist + 1e-6)                                   # B, N, N, 1
 
-        # 3) 用场景尺度做一个归一化（防止绝对坐标范围太大）
-        scene_min = coord_min.min(dim=1, keepdim=True)[0]   # (B, 1, 3)
-        scene_max = coord_max.max(dim=1, keepdim=True)[0]   # (B, 1, 3)
-        scene_size = (scene_max - scene_min).clamp(min=eps)     # (B, 1, 3)
-        scene_size = scene_size.view(B, 1, 1, 3)                # 显式 reshape
-        norm_delta = delta / scene_size                         # (B, N, N, 3)
+        # bbox 尺寸：dx, dy, dz
+        sizes = corners.max(dim=2)[0] - corners.min(dim=2)[0]                # B, N, 3
+        size_i = sizes[:, :, None, :]                                        # B, N, 1, 3
+        size_j = sizes[:, None, :, :]                                        # B, 1, N, 3
+        size_diff = size_j - size_i                                          # B, N, N, 3
+        size_ratio = size_j / (size_i + 1e-6)                                # B, N, N, 3
 
-        # 4) 尺寸比例（log 比例更稳定）
-        size_i = sizes[:, :, None, :]        # (B, N, 1, 3)
-        size_j = sizes[:, None, :, :]        # (B, 1, N, 3)
-        size_ratio = (size_j / (size_i + eps)).clamp(min=eps, max=10.0)  # (B, N, N, 3)
-        log_size_ratio = torch.log(size_ratio)                            # (B, N, N, 3)
-
-        # 5) 体积 + AABB 交并体积
-        vol_i = (size_i[..., 0] * size_i[..., 1] * size_i[..., 2]).clamp(min=eps)  # (B, N, 1)
-        vol_j = (size_j[..., 0] * size_j[..., 1] * size_j[..., 2]).clamp(min=eps)  # (B, 1, N)
-
-        min_i = coord_min[:, :, None, :]     # (B, N, 1, 3)
-        max_i = coord_max[:, :, None, :]
-        min_j = coord_min[:, None, :, :]     # (B, 1, N, 3)
-        max_j = coord_max[:, None, :, :]
-
-        inter_min = torch.max(min_i, min_j)               # (B, N, N, 3)
-        inter_max = torch.min(max_i, max_j)               # (B, N, N, 3)
-        inter_dims = (inter_max - inter_min).clamp(min=0) # (B, N, N, 3)
-        inter_vol = inter_dims[..., 0] * inter_dims[..., 1] * inter_dims[..., 2]  # (B, N, N)
-
-        union_vol = (vol_i + vol_j - inter_vol).clamp(min=eps)  # 广播到 (B, N, N)
-
-        # 6) IoU & 双向包含率
-        iou = (inter_vol / union_vol).unsqueeze(-1)              # (B, N, N, 1)
-
-        # i 被 j 覆盖多少（更像“i 嵌在 j 里多少”）
-        contain_i_in_j = (inter_vol / vol_i).clamp(max=1.0).unsqueeze(-1)  # (B, N, N, 1)
-
-        # j 有多少体积在 i 内（对“sink 在 counter 里面”这一类最有用）
-        contain_j_in_i = (inter_vol / vol_j).clamp(max=1.0).unsqueeze(-1)  # (B, N, N, 1)
-
-        # 7) 拼接几何特征
-        # 维度统计：
-        # norm_delta (3) + abs_delta (3) + dist (1) + log_size_ratio (3)
-        # + iou (1) + contain_i_in_j (1) + contain_j_in_i (1) = 13
-        geom = torch.cat([
-            norm_delta,        # 3
-            abs_delta,         # 3 -> 6
-            dist,              # 1 -> 7
-            log_size_ratio,    # 3 -> 10
-            iou,               # 1 -> 11
-            contain_i_in_j,    # 1 -> 12
-            contain_j_in_i,    # 1 -> 13
-        ], dim=-1)             # (B, N, N, 13)
+        geom = torch.cat(
+            [rel_vec, dist, horiz_dist, cos_elev, size_diff, size_ratio],
+            dim=-1
+        )  # B, N, N, 12
 
         return geom
 
@@ -181,7 +147,7 @@ class RelationModule(nn.Module):
         batch_size, num_proposal = features.shape[:2]
 
         corners = data_dict["pred_bbox_corner"]                        # (B, N, 8, 3)
-        centers = corners.mean(dim=2)                      # (B, N, 3)
+        centers = self._get_bbox_centers(corners)                      # (B, N, 3)
 
         # 2) 构造几何特征 & 可选 kNN mask
         if self.use_dist_weight_matrix:
