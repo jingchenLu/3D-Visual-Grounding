@@ -61,3 +61,4 @@ data/a.json
 *.json
 
 demo_files/*
+data_full_with_source.tar.gz

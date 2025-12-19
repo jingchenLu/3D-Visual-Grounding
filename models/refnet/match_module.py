@@ -101,7 +101,8 @@ class MatchModule(nn.Module):
 
         # =====================================================
         # 2) 否则使用原始 bbox_feature 做 copy-paste 增强 + repeat
-        #    —— 这一块完全按原版实现，不要改形状逻辑
+        #    —— 背景 proposal 不再是“明显的背景特征”，逼迫匹配模块更依赖语言条件与细粒度语义，
+        #       而不是只靠“objectness/背景差异”就能分出高分。
         # =====================================================
         if data_dict["istrain"][0] == 1 and data_dict["random"] < 0.5:
             obj_masks = objectness_masks.bool().squeeze(2)  # (B, N)
@@ -120,15 +121,15 @@ class MatchModule(nn.Module):
 
             j = 0
             for i in range(batch_size):
-                obj_mask = torch.where(obj_masks[i, :] == False)[0]  # 该样本负样本 index
+                obj_mask = torch.where(obj_masks[i, :] == False)[0]  # 该样本背景 index
                 obj_len = obj_mask.shape[0]
                 j += obj_lens[i]                                    # 该样本累积正样本数
 
                 if obj_len < total_len - obj_lens[i]:
-                    # 正样本多，负样本少 → 用 obj_len 个正样本填满所有负样本
+                    # 正样本多，负样本少 → 用 obj_len 个正样本填满背景
                     feature0[i, obj_mask, :] = obj_features[j:j + obj_len, :]
                 else:
-                    # 负样本多，正样本少 → 只替换掉一部分负样本即可
+                    # 负样本多，正样本少 → 只替换掉一部分背景即可
                     feature0[i, obj_mask[:total_len - obj_lens[i]], :] = \
                         obj_features[j:j + total_len - obj_lens[i], :]
 
@@ -157,7 +158,7 @@ class MatchModule(nn.Module):
         confidence1 = confidence1.view(batch_size * len_nun_max, num_proposal)
 
         # ------------------------------------------------------
-        # 4) lang_emb branch（保持与原版一致）
+        # 4) lang_emb branch
         # ------------------------------------------------------
         if self.use_lang_emb:
             lang_emb = data_dict["lang_emb"]           # (B*L, H)

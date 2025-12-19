@@ -88,7 +88,7 @@ class JointNet(nn.Module):
             self.lang = LangBertModule(
                 num_class=num_class, use_lang_classifier=use_lang_classifier, pc_hidden_size=128, lang_hidden_size=128, unfreeze=self.unfreeze, use_distil=self.use_distil)
 
-            self.positive_match = PositiveMatchModule()
+            # self.positive_match = PositiveMatchModule()
 
             # 目标级自对比学习模块（筛选正负样本，使正样本特征嵌入更接近）
             # 跨对比对齐模块（）

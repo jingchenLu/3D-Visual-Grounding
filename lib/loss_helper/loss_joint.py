@@ -204,13 +204,12 @@ def get_joint_loss(args, data_dict, device, config, weights, pad_token_id,
             loss += 0.3*data_dict["lang_loss"]
 
     if args.use_con:
-        if data_dict["epoch"] < 50:
-            loss += 0
-        else:
-            data_dict["con_loss"] = 0.5*data_dict["lang_con_loss"] + 2.5*data_dict["iou_con_loss"] 
-            loss += data_dict["con_loss"]
+        con_w = float(data_dict.get("con_w", 1.0))
+        data_dict["con_loss"] = con_w * (0.5 * data_dict["lang_con_loss"] + 2.5 * data_dict["iou_con_loss"])
+        loss += data_dict["con_loss"]
     else:
-        data_dict["con_loss"] = torch.zeros(1)
+        data_dict["con_loss"] = torch.zeros(1, device=device)
+
 
     if args.use_mlm:
         # if data_dict["epoch"] >= 50:
