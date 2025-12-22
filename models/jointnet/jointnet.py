@@ -154,7 +154,8 @@ class JointNet(nn.Module):
 
         # --------- PROPOSAL GENERATION ---------
         data_dict = self.proposal(xyz, features, data_dict)
-        
+        # --------- RELATION MODULE --------- 
+        data_dict = self.relation(data_dict)
 
         if not self.no_reference:
             #######################################
@@ -163,8 +164,7 @@ class JointNet(nn.Module):
             #                                     #
             #######################################
             data_dict = self.lang(data_dict)
-            # --------- RELATION MODULE --------- 从proposal调整到lang之后
-            data_dict = self.relation(data_dict)
+            
 
             #######################################
             #                                     #
