@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 class LangGuidedRelationEncoder(nn.Module):
     def __init__(self, hidden_size=128, lang_dim=128,
-                 num_heads=4, geom_dim=12, rel_extra_dim=0):
+                 num_heads=4, geom_dim=12, rel_extra_dim=0 ):
         super().__init__()
         self.hidden_size = hidden_size
         self.lang_dim = lang_dim

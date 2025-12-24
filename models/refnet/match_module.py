@@ -9,7 +9,7 @@ import random
 import numpy as np
 
 class MatchModule(nn.Module):
-    def __init__(self, num_proposals=256, lang_size=256, hidden_size=128, lang_num_size=300, det_channel=128, head=4, use_lang_emb=False, use_pc_encoder=False, use_match_con_loss=False, depth=2, use_reg_head=False):
+    def __init__(self, num_proposals=256, lang_size=256, hidden_size=128, lang_num_size=300, det_channel=128, head=4, use_lang_emb=False, use_pc_encoder=False, use_match_con_loss=False, depth=2, use_reg_head=False, dropout=0.3):
         super().__init__()
         self.num_proposals = num_proposals
         self.lang_size = lang_size
@@ -89,6 +89,7 @@ class MatchModule(nn.Module):
         # 一个可学习 gate，初始为 0，相当于刚开始不改变原特征
         self.lang_rel_gamma = nn.Parameter(torch.zeros(1))
 
+        self.dropout = nn.Dropout(dropout) # 定义 dropout
 
     def forward(self, data_dict):
         """
@@ -178,9 +179,9 @@ class MatchModule(nn.Module):
                 extra_rel=None,
                 return_attn=True
             )
-
-            # feature1 = residual + rel_out   # 直接残差
-            feature1 = residual + self.lang_rel_gamma * rel_out  # 带gate的残差
+            
+            rel_out = self.dropout(rel_out)
+            feature1 = residual + torch.tanh(self.lang_rel_gamma) * rel_out  # 带gate的残差
 
             # 存下来方便可视化
             data_dict["rel_attn"] = loe_attn.detach()      # (B*L, H, N, N)

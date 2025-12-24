@@ -22,6 +22,7 @@ from lib.pointnet2.pytorch_utils import BNMomentumScheduler
 from lib.joint.prefetcher import Prefetcher
 import wandb
 from utils.utils_fn import final_eval_fn
+from utils.box_util import box3d_diou_batch_tensor
 
 ITER_REPORT_TEMPLATE = """
 -------------------------------iter: [{epoch_id}: {iter_id}/{total_iter}]-------------------------------
@@ -308,12 +309,17 @@ class Solver():
 
                     # eval
                     print("evaluating...")
+                    
                     if epoch_id < 150:
                         val_data_loader = self.dataloader["eval"]["val"]
                     else:
                         val_data_loader = self.dataloader["eval"]["ground"]
                     if self.final_eval:
                         val_data_loader = self.dataloader["eval"]["ground"]
+                    
+                    # 12月22日 新增记录对比学习的簇
+                    self._maybe_dump_overlap_cluster(dataloader=val_data_loader, epoch_id=epoch_id, phase="train")
+
                     # with torch.no_grad():
                     self._feed(val_data_loader,"val", epoch_id, is_eval=True)
                     self._epoch_report(epoch_id)
@@ -1469,3 +1475,106 @@ class Solver():
         self._log(best_report)
         with open(os.path.join(CONF.PATH.OUTPUT, self.stamp, "best.txt"), "w") as f:
             f.write(best_report)
+
+    
+    def _maybe_dump_overlap_cluster(self, dataloader, epoch_id, phase):
+        # 只在训练阶段末尾/或每个epoch第一次遇到时dump，避免频繁写盘
+        if phase != "train":
+            return
+        if epoch_id not in [49, 99]:  # epoch_id 从 0 开始：第50=49，第100=99
+            return
+
+        # 只 dump 一次
+        tag = f"ep{epoch_id+1:03d}"
+        model_root = os.path.join(CONF.PATH.OUTPUT, self.stamp)
+        out_dir = os.path.join(model_root, "contrast_cluster_dump")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{tag}.npz")
+        if os.path.exists(out_path):
+            return
+
+        # 用 val 的第一个 batch（固定样本）
+        self.model.eval()
+        with torch.no_grad():
+            val_iter = iter(dataloader)
+            val_data = next(val_iter)
+            for k in val_data:
+                if torch.is_tensor(val_data[k]):
+                    val_data[k] = val_data[k].to(self.device, non_blocking=True)
+
+            val_data["epoch"] = epoch_id + 1
+            val_data["istrain"] = torch.tensor([0]).to(self.device)  # 确保走 eval 分支
+            val_out = self.model(val_data, use_tf=self.use_tf)
+
+            dump = self._build_cluster_dump(val_out, epoch_id+1)
+            np.savez_compressed(out_path, **dump)
+
+        self.model.train()
+
+
+    def _build_cluster_dump(self, data_dict, epoch_num: int):
+        """
+        抓一个 batch 内 i=0, j=0 的“同一物体”proposal 重叠簇
+        """
+        device = data_dict["bbox_feature"].device
+        i0, j0 = 0, 0
+
+        # proposals
+        pred_center = data_dict["pred_center"][i0]          # (N,3)
+        pred_size   = data_dict["pred_size"][i0]            # (N,3)
+        pred_corner = data_dict["pred_bbox_corner"][i0]     # (N,8,3) 仅用于画框更直观
+        feat        = data_dict["bbox_feature"][i0]         # (N,H)
+        pc = data_dict["point_clouds"][i0][..., 0:3]  # (P,3)
+        # 下采样，避免 npz 太大
+        P = pc.shape[0]
+        keep = min(P, 4000)
+        idx = torch.randperm(P, device=pc.device)[:keep]
+        pc = pc[idx].detach().cpu().numpy()
+        N = pred_center.shape[0]
+
+        # GT（和 grounding loss 一致：用 param2obb 得到 center/size，再用 axis-aligned IoU/DIoU）
+        gt_center_list = data_dict["ref_center_label_list"][i0][:, 0:3]
+        gt_hcls_list   = data_dict["ref_heading_class_label_list"][i0]
+        gt_hres_list   = data_dict["ref_heading_residual_label_list"][i0]
+        gt_scls_list   = data_dict["ref_size_class_label_list"][i0]
+        gt_sres_list   = data_dict["ref_size_residual_label_list"][i0]
+
+        gt_center_all, gt_size_all = self.config.param2obb_batch_tensor(
+            gt_center_list, gt_hcls_list, gt_hres_list, gt_scls_list, gt_sres_list
+        )
+        gt_center = gt_center_all[j0]  # (3,)
+        gt_size   = gt_size_all[j0]    # (3,)
+
+        gt_center_rep = gt_center[None, :].repeat(N, 1)
+        gt_size_rep   = gt_size[None, :].repeat(N, 1)
+
+        ious, _ = box3d_diou_batch_tensor(pred_center, pred_size, gt_center_rep, gt_size_rep)
+        ious = ious.detach()
+
+        K = 10
+        topk = min(K, N)
+        cluster_idx = torch.topk(ious, k=topk, largest=True).indices
+        cluster_idx = cluster_idx.sort().values  # 可选：排序让可视化顺序稳定
+
+        # 同时选一些“明显负例”：IoU<0.05，做分离度可视化
+        neg_idx = torch.where(ious < 0.05)[0]
+        if neg_idx.numel() > 64:
+            neg_idx = neg_idx[:64]
+
+        num_ge_025 = (ious >= 0.25).sum().item()
+        num_ge_05  = (ious >= 0.5).sum().item()
+        return {
+            "epoch": np.array([epoch_num], dtype=np.int32),
+            "gt_center": gt_center.detach().cpu().numpy(),
+            "gt_size": gt_size.detach().cpu().numpy(),
+            "pred_corner": pred_corner.detach().cpu().numpy(),
+            "pred_center": pred_center.detach().cpu().numpy(),
+            "pred_size": pred_size.detach().cpu().numpy(),
+            "feat": feat.detach().cpu().numpy(),
+            "ious": ious.detach().cpu().numpy(),
+            "cluster_idx": cluster_idx.detach().cpu().numpy(),
+            "neg_idx": neg_idx.detach().cpu().numpy(),
+            "pc_xyz": pc,
+            "num_ge_025": np.array([num_ge_025], dtype=np.int32),
+            "num_ge_05":  np.array([num_ge_05], dtype=np.int32),
+        }
