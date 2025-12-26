@@ -4,12 +4,12 @@ import torch.nn.functional as F
 from models.transformer.attention import MultiHeadAttention
 from models.transformer.mmattention import MultiModalAttention, CrossAttentionDecoderLayer
 from models.transformer.utils import PositionWiseFeedForward
-from models.refnet.lang_guide_relation import LangGuidedRelationEncoder
+from models.refnet.lang_guide_relation import LangCondGeomBiasSelfAttn
 import random
 import numpy as np
 
 class MatchModule(nn.Module):
-    def __init__(self, num_proposals=256, lang_size=256, hidden_size=128, lang_num_size=300, det_channel=128, head=4, use_lang_emb=False, use_pc_encoder=False, use_match_con_loss=False, depth=2, use_reg_head=False, dropout=0.3):
+    def __init__(self, num_proposals=256, lang_size=256, hidden_size=128, lang_num_size=300, det_channel=128, head=4, use_lang_emb=False, use_pc_encoder=False, use_match_con_loss=False, depth=2, use_reg_head=False):
         super().__init__()
         self.num_proposals = num_proposals
         self.lang_size = lang_size
@@ -18,6 +18,13 @@ class MatchModule(nn.Module):
         self.use_pc_encoder = use_pc_encoder
         self.depth = depth
         self.use_reg_head = use_reg_head
+
+        # ===== new args =====
+        use_lang_rel_module: bool = True
+        rel_k: int = 128
+        rel_dropout: float = 0.3
+        rel_warmup_epochs: int = 10
+        rel_alpha_init: float = 0.05
 
         # self.match = nn.Sequential(
         #     nn.Conv1d(hidden_size, hidden_size, 1),
@@ -76,20 +83,16 @@ class MatchModule(nn.Module):
 
         self.use_lang_rel_module = True  # 开关，做 ablation 用
 
-        self.lang_rel_encoder = LangGuidedRelationEncoder(
-            hidden_size=hidden_size,
-            lang_dim=128,
-            num_heads=head,
-            geom_dim=12,          # 你的 _build_relation_geom 输出 12 维
-            rel_extra_dim=0       # 如果后面想加其它关系特征，这里可以改
-        )
-        # 残差前的 LayerNorm
-        self.lang_rel_ln = nn.LayerNorm(hidden_size)
-
-        # 一个可学习 gate，初始为 0，相当于刚开始不改变原特征
-        self.lang_rel_gamma = nn.Parameter(torch.zeros(1))
-
-        self.dropout = nn.Dropout(dropout) # 定义 dropout
+        if self.use_lang_rel_module:
+            self.lang_geom_attn = LangCondGeomBiasSelfAttn(
+                hidden_size=hidden_size,
+                num_heads=head,
+                geom_dim=12,
+                k_rel=rel_k,
+                dropout=rel_dropout,
+                warmup_epochs=rel_warmup_epochs,
+                alpha_init=rel_alpha_init,
+            )
 
     def forward(self, data_dict):
         """
@@ -152,41 +155,42 @@ class MatchModule(nn.Module):
         lang_fea = data_dict["lang_fea"]
         lang_fea = lang_fea[:,1:]
 
-        # ---------- 语言引导关系模块（LOE+LRE 风格） ----------
+        # ===== LC-GeomBias Self-Attn BEFORE cross-attn =====
         if self.use_lang_rel_module:
-            # 1) bbox 几何：中心 + corner，按句子复制
-            corners = data_dict["pred_bbox_corner"]             # (B, N, 8, 3)
+            corners = data_dict["pred_bbox_corner"]  # (B, N, 8, 3)
+            # centers from corners
             coord_min = torch.min(corners, dim=2)[0]
             coord_max = torch.max(corners, dim=2)[0]
-            centers = (coord_min + coord_max) / 2.0             # (B, N, 3)
+            centers = (coord_min + coord_max) / 2.0  # (B, N, 3)
 
-            centers = centers[:, None, :, :].repeat(
-                1, len_nun_max, 1, 1
-            ).reshape(batch_size * len_nun_max, num_proposal, 3)   # (B*L, N, 3)
-            corners_rep = corners[:, None, :, :, :].repeat(
-                1, len_nun_max, 1, 1, 1
-            ).reshape(batch_size * len_nun_max, num_proposal, 8, 3)  # (B*L, N, 8, 3)
-
-            # 如果你有额外的关系特征（比如语义差），在这里构建 extra_rel: (B*L, N, N, D_extra)
-            extra_rel = None
-            
-            # 2) 残差 + gate
-            residual = feature1
-            x = self.lang_rel_ln(feature1)   # 做个LN更稳定
-
-            rel_out, loe_attn, rel_score = self.lang_rel_encoder(
-                x, centers, corners_rep, lang_fea,
-                extra_rel=None,
-                return_attn=True
+            # repeat to (BL, ...)
+            centers = centers[:, None, :, :].repeat(1, len_nun_max, 1, 1).reshape(
+                batch_size * len_nun_max, num_proposal, 3
             )
-            
-            rel_out = self.dropout(rel_out)
-            feature1 = residual + torch.tanh(self.lang_rel_gamma) * rel_out  # 带gate的残差
+            corners_rep = corners[:, None, :, :, :].repeat(1, len_nun_max, 1, 1, 1).reshape(
+                batch_size * len_nun_max, num_proposal, 8, 3
+            )
 
-            # 存下来方便可视化
-            data_dict["rel_attn"] = loe_attn.detach()      # (B*L, H, N, N)
-            data_dict["rel_score"] = rel_score.detach()    # (B*L, N, N)
-            data_dict["rel_centers"] = centers.detach()    # (B*L, N, 3)  几何中心，用于画散点
+            obj_mask = objectness_masks.squeeze(2).bool()  # (B, N)
+            obj_mask = obj_mask[:, None, :].repeat(1, len_nun_max, 1).reshape(
+                batch_size * len_nun_max, num_proposal
+            )  # (BL, N)
+
+            epoch = data_dict.get("epoch", None)
+            feature1, rel_attn, rel_bias = self.lang_geom_attn(
+                feature1, lang_fea, centers, corners_rep,
+                obj_mask=obj_mask, epoch=epoch, return_attn=True
+            )
+
+            # store for visualization
+            data_dict["rel_attn"] = rel_attn       # (BL, H, N, N)
+            data_dict["rel_bias"] = rel_bias       # (BL, H, N, N)
+            data_dict["rel_centers"] = centers     # (BL, N, 3)
+        else:
+            # corners not provided -> skip safely
+            data_dict["rel_attn"] = None
+            data_dict["rel_bias"] = None
+            data_dict["rel_centers"] = None
 
         # ---------------------------------------------------
 
