@@ -131,17 +131,20 @@ class LangCondGeomBiasSelfAttn(nn.Module):
         bias = self.geom2bias(geom)                                   # (BL, N, N, H)
         bias = bias.permute(0, 3, 1, 2).contiguous()                  # (BL, H, N, N)
 
+        # 语言条件化头权重(每个注意力头的权重)
         # ---- language -> head weights ----
         # sentence embedding: mean over tokens
         sent = lang_fea.mean(dim=1)                                  # (BL, C)
         head_w = torch.sigmoid(self.txt2head(sent))                   # (BL, H)
         head_w = head_w[:, :, None, None]                             # (BL, H, 1, 1)
 
+        # 在训练初期（epoch < warmup_epochs）减少几何偏置影响
         # ---- warmup scale ----
         warm = 1.0
         if (epoch is not None) and (self.warmup_epochs is not None) and (self.warmup_epochs > 0):
             warm = float(min(1.0, max(0.0, epoch / float(self.warmup_epochs))))
 
+        # 物体掩码过滤：确保只有有效物体参与注意力计算
         # ---- attention mask (top-k + objectness) ----
         knn_mask = self._topk_mask_from_centers(centers, self.k_rel)  # (BL, N, N)
         attn_mask = knn_mask

@@ -21,6 +21,7 @@ from models.answer_module.answer_module import AnswerModule
 from models.caption_module.transformer_captioner import TransformerDecoderModel
 from models.mlcvnet.backbone_module import Pointnet2Backbone as MLCVPointnet2Backbone
 from models.mlcvnet.voting_module import VotingModule as MLCVVotingModule
+from models.jointnet.gsa_module import GlobalBiasGSA
 
 class JointNet(nn.Module):
     def __init__(self, num_class, num_heading_bin, num_size_cluster, mean_size_arr, vocabulary, embeddings=None,
@@ -81,6 +82,17 @@ class JointNet(nn.Module):
 
         self.relation = RelationModule(
             num_proposals=num_proposal, det_channel=128)  # bef 256
+        
+        # # GSA after relation (scene_in_dim usually 256 from fp2/seed_features)
+        # self.gsa_after_relation = GlobalBiasGSA(
+        #     d_model=128,
+        #     nhead=4,
+        #     depth=1,
+        #     scene_in_dim=256,   # 这里务必与你 data_dict["seed_features"] 的 channel 对齐
+        #     d_ff=256,
+        #     dropout=0.1,
+        #     top_scene_k=None
+        # )
         if not no_reference:
             # --------- LANGUAGE ENCODING ---------
             # Encode the input descriptions into vectors
@@ -156,6 +168,8 @@ class JointNet(nn.Module):
         data_dict = self.proposal(xyz, features, data_dict)
         # --------- RELATION MODULE --------- 
         data_dict = self.relation(data_dict)
+
+        # data_dict = self.gsa_after_relation(data_dict)  # <--- add this
 
         if not self.no_reference:
             #######################################

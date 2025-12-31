@@ -19,8 +19,7 @@ class MatchModule(nn.Module):
         self.depth = depth
         self.use_reg_head = use_reg_head
 
-        # ===== new args =====
-        use_lang_rel_module: bool = True
+       
         rel_k: int = 128
         rel_dropout: float = 0.3
         rel_warmup_epochs: int = 10
@@ -81,7 +80,7 @@ class MatchModule(nn.Module):
         self.temp = nn.Parameter(torch.ones([]) * 0.07)
         self.use_match_con_loss = use_match_con_loss
 
-        self.use_lang_rel_module = True  # 开关，做 ablation 用
+        self.use_lang_rel_module = False  # 开关，做 ablation 用
 
         if self.use_lang_rel_module:
             self.lang_geom_attn = LangCondGeomBiasSelfAttn(
