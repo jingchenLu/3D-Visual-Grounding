@@ -169,16 +169,6 @@ def eval_ref(args):
     pred_path = os.path.join(CONF.PATH.OUTPUT, args.folder, "predictions.p")
     gen_flag = (not os.path.exists(score_path)) or args.force or args.repeat > 1
     if gen_flag:
-        # === 1. 初始化细粒度时间列表 ===
-        time_stats = {
-            'pointnet': [],
-            'vote_prop': [],
-            'relation': [],
-            'text': [],
-            'fusion': [],
-            'total': []
-        }
-
         ref_acc_all = []
         ious_all = []
         masks_all = []
@@ -198,34 +188,33 @@ def eval_ref(args):
             others = []
             lang_acc = []
             predictions = {}
-
-            # 增加 enumerate 获取 index
-            for i, data in enumerate(tqdm(dataloader)):
+            for data in tqdm(dataloader):
                 target_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
                 for key in data:
+                    # data[key] = data[key].cuda()
+                    # 2. 修改这里：显式搬运到目标设备
                     if isinstance(data[key], torch.Tensor):
-                        data[key] = data[key].to(target_device)
+                        data[key] = data[key].to(target_device) # 替代 .cuda()
 
                 # feed
                 with torch.no_grad():
                     data["epoch"] = 0
-                    # === 2. 模型推理 (预热 5 个 batch) ===
-                    warmup = i < 5
-                    # 确保传入 is_eval=True
-                    data = model(data, is_eval=True)
-                    
-                    # === 3. 收集时间 ===
-                    if not warmup and 'exec_times' in data:
-                        et = data['exec_times']
-                        time_stats['pointnet'].append(et['pointnet_time'])
-                        time_stats['vote_prop'].append(et['voting_proposal_time'])
-                        time_stats['relation'].append(et['relation_time'])
-                        time_stats['text'].append(et['text_time'])
-                        time_stats['fusion'].append(et['fusion_time'])
-                        time_stats['total'].append(et['total_time'])
-                    
+                    data = model(data)
                     device = data['point_clouds'].device
-                    
+                    # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+                    # 11月9日注释修改
+                    # data = get_joint_loss(
+                    #     data_dict=data,
+                    #     device=device,
+                    #     config=DC,
+                    #     weights=0,
+                    #     detection=True,
+                    #     caption=False,
+                    #     reference=True, 
+                    #     use_lang_classifier=not args.no_lang_cls,
+                    #     orientation=False,
+                    #     distance=False,
+                    # )
                     data = get_joint_loss(
                         args,
                         data_dict=data,
@@ -307,34 +296,6 @@ def eval_ref(args):
                 "lang_acc": lang_acc_all
             }
             pickle.dump(scores, f)
-        
-        # === 4. 打印详细的时间统计表格 ===
-        if len(time_stats['total']) > 0:
-            avg_pn = np.mean(time_stats['pointnet'])
-            avg_vp = np.mean(time_stats['vote_prop'])
-            avg_rel = np.mean(time_stats['relation'])
-            avg_txt = np.mean(time_stats['text'])
-            avg_fus = np.mean(time_stats['fusion'])
-            avg_tot = np.mean(time_stats['total'])
-            
-            # 计算 FPS (基于 Batch Size)
-            fps = args.batch_size / avg_tot
-            
-            print("\n" + "="*50)
-            print(f"Fine-grained Latency Analysis (Batch Size = {args.batch_size})")
-            print("-" * 50)
-            print(f"{'Module':<25} | {'Time (s)':<10} | {'Ratio':<10}")
-            print("-" * 50)
-            print(f"{'PointNet++ (Backbone)':<25} | {avg_pn:.4f}     | {avg_pn/avg_tot*100:.1f}%")
-            print(f"{'Voting & Proposal':<25} | {avg_vp:.4f}     | {avg_vp/avg_tot*100:.1f}%")
-            print(f"{'Relation Module':<25} | {avg_rel:.4f}     | {avg_rel/avg_tot*100:.1f}%")
-            print(f"{'Text Encoder (BERT)':<25} | {avg_txt:.4f}     | {avg_txt/avg_tot*100:.1f}%")
-            print(f"{'Fusion (Match)':<25} | {avg_fus:.4f}     | {avg_fus/avg_tot*100:.1f}%")
-            print("-" * 50)
-            print(f"{'Total Latency':<25} | {avg_tot:.4f}     | 100.0%")
-            print("-" * 50)
-            print(f"System FPS                : {fps:.2f}")
-            print("="*50 + "\n")
 
     else:
         print("loading the scores...")

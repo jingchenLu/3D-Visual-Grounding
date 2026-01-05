@@ -37,7 +37,7 @@ class GlobalBiasGSA(nn.Module):
         use_xyz_pos=True,
         xyz_hidden=128,           # hidden size inside xyz_mlp
         xyz_ln=True,              # add LayerNorm at the end of xyz_mlp output (recommended)
-        xyz_scale_init=0.1,       # start from 0 for stable finetune at epoch200; can set 0.1 if you want stronger effect
+        xyz_scale_init=0,       # start from 0 for stable finetune at epoch200; can set 0.1 if you want stronger effect
 
         # [KEEP for ckpt] legacy bias switch (default False)
         enable_global_bias=False,
