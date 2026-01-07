@@ -62,3 +62,7 @@ data/a.json
 
 demo_files/*
 data_full_with_source.tar.gz
+
+# --- Add this to your .gitignore ---
+*.so
+*.o
