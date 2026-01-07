@@ -91,6 +91,8 @@ def get_scanrefer(args):
             data = deepcopy(SCANREFER_TRAIN[0])
             data["scene_id"] = scene_id
             scanrefer.append(data)
+        scanrefer_val_new = [[d] for d in scanrefer]
+        return scanrefer, scene_list, scanrefer_val_new
     else:
         scanrefer = SCANREFER_TRAIN if args.use_train else SCANREFER_VAL
         scene_list = sorted(list(set([data["scene_id"] for data in scanrefer])))
@@ -439,14 +441,18 @@ def eval_det(args):
     
     # init training dataset
     print("preparing data...")
-    scanrefer, scene_list = get_scanrefer(args)
+    scanrefer, scene_list, scanrefer_val_new = get_scanrefer(args)
 
     # dataloader
-    _, dataloader = get_dataloader(args, scanrefer, scene_list, "val", DC)
+    dataset, dataloader = get_dataloader(args, scanrefer, scanrefer_val_new, scene_list, "val", DC)
 
+    gpu_id = int(args.gpu)
+    device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
     # model
-    model = get_model(args, DC)
-
+    model = get_model(args, DC, dataset)
+    model.to(device)
+    model.eval()
+    
     # config
     POST_DICT = {
         "remove_empty_box": True, 
@@ -468,12 +474,21 @@ def eval_det(args):
 
         # feed
         with torch.no_grad():
+            data["epoch"] = 0
             data = model(data)
-            _, data = get_loss(
-                data_dict=data, 
-                config=DC, 
+            data = get_joint_loss(
+                args,
+                data_dict=data,
+                device=device,
+                config=DC,
+                weights=0,
+                pad_token_id=0,
                 detection=True,
-                reference=False
+                caption=False,
+                reference=False,
+                use_lang_classifier=not args.no_lang_cls,
+                orientation=False,
+                distance=False,
             )
             data = get_eval(
                 data_dict=data, 
@@ -539,6 +554,6 @@ if __name__ == "__main__":
 
 
     # evaluate
-    if args.reference: eval_ref(args)
-    # if args.detection: eval_det(args)
+    # if args.reference: eval_ref(args)
+    if args.detection: eval_det(args)
 
