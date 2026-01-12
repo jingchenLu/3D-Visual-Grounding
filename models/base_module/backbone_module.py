@@ -46,9 +46,8 @@ def knn_indices_chunked(xyz: torch.Tensor, new_xyz: torch.Tensor, k: int, chunk_
 def knn_query(xyz: torch.Tensor, new_xyz: torch.Tensor, k: int, chunk_size: int = 1024) -> torch.Tensor:
     """
     Prefer CUDA KNN kernel if your pointnet2_utils provides it, otherwise chunked torch KNN.
-    Return (B,S,k) int indices.
+    Return (B,S,k) long indices.
     """
-    # Some repos provide knn_point(k, xyz, new_xyz) -> (dist, idx) or idx
     if hasattr(pointnet2_utils, "knn_point"):
         try:
             out = pointnet2_utils.knn_point(k, xyz, new_xyz)
@@ -62,15 +61,46 @@ def knn_query(xyz: torch.Tensor, new_xyz: torch.Tensor, k: int, chunk_size: int 
     return knn_indices_chunked(xyz, new_xyz, k, chunk_size=chunk_size).long()
 
 
-def safe_ball_query(radius: float, nsample: int, xyz: torch.Tensor, new_xyz: torch.Tensor, knn_fallback_chunk: int = 1024):
+@torch.no_grad()
+def safe_ball_query_with_mask(
+    radius: float,
+    nsample: int,
+    xyz: torch.Tensor,
+    new_xyz: torch.Tensor,
+    knn_fallback_chunk: int = 1024,
+):
     """
-    Return (B,S,nsample) indices for ball neighborhood.
-    If ball_query is not available, fallback to KNN + radius mask.
+    Return:
+      idx  : (B,S,nsample) long indices (clamped >=0 for grouping)
+      valid: (B,S,nsample) bool mask indicating REAL neighbors within radius
+
+    If ball_query exists:
+      - use its output
+      - treat idx < 0 as invalid
+    Else fallback:
+      - KNN candidates + radius mask
     """
+    B, N, _ = xyz.shape
+    _, S, _ = new_xyz.shape
+
     if hasattr(pointnet2_utils, "ball_query"):
-        idx = pointnet2_utils.ball_query(radius, nsample, xyz, new_xyz).long()  # (B,S,nsample)
-        idx = torch.clamp(idx, min=0)
-        return idx
+        idx_raw = pointnet2_utils.ball_query(radius, nsample, xyz, new_xyz).long()  # (B,S,nsample), may contain -1
+        valid = idx_raw >= 0
+
+        # clamp for grouping op
+        idx = torch.clamp(idx_raw, min=0)
+
+        # safety: ensure each query has at least one valid
+        valid_cnt = valid.sum(-1)  # (B,S)
+        need_fix = valid_cnt == 0
+        if need_fix.any():
+            # fallback to nearest point for those queries
+            # take 1-NN
+            nn1 = knn_query(xyz, new_xyz, k=1, chunk_size=knn_fallback_chunk)  # (B,S,1)
+            idx[need_fix] = nn1[need_fix].expand(-1, nsample)
+            valid[need_fix] = True
+
+        return idx, valid
 
     # Fallback: take KNN candidates and keep those within radius; pad if insufficient
     cand_k = max(nsample * 2, nsample)
@@ -82,33 +112,38 @@ def safe_ball_query(radius: float, nsample: int, xyz: torch.Tensor, new_xyz: tor
     dist2 = (rel ** 2).sum(1)  # (B,S,cand_k)
 
     r2 = float(radius * radius) + 1e-6
+    within = dist2 <= r2
     dist2_masked = dist2.clone()
-    dist2_masked[dist2 > r2] = float("inf")
+    dist2_masked[~within] = float("inf")
 
     sel_dist2, sel = torch.topk(dist2_masked, k=nsample, dim=-1, largest=False, sorted=True)
     idx = cand_idx.gather(-1, sel)  # (B,S,nsample)
+    valid = ~torch.isinf(sel_dist2)
 
     # if some are inf (not enough within radius), fill with nearest overall
     fill = cand_idx[..., :1].expand_as(idx)
-    idx = torch.where(torch.isinf(sel_dist2), fill, idx)
-    return idx.long()
+    idx = torch.where(torch.isinf(sel_dist2), fill, idx).long()
+
+    # ensure at least one valid per query
+    valid_cnt = valid.sum(-1)
+    need_fix = valid_cnt == 0
+    if need_fix.any():
+        idx[need_fix] = cand_idx[need_fix, :, :1].expand(-1, nsample)
+        valid[need_fix] = True
+
+    return idx.long(), valid
 
 
 # -------------------------
-# PAM: Point Augmented Aggregation Module (paper-style)
+# PAM: Paper-style + (1) Dist decay bias + (2) Adaptive J (mask)
 # -------------------------
 class PAModuleVotes(nn.Module):
     """
-    Paper-style PAM:
-      - FPS samples query points
-      - Ball Query gets local spherical neighbors (nsample)
-      - Feature aggregation augments with J (=n_aug) nearest points excluded from the sphere
-      - Vector attention aggregation (channel-wise attention) instead of max-pooling
-
-    Output matches PointnetSAModuleVotes: (new_xyz, new_features, fps_inds)
-      new_xyz      : (B, npoint, 3)
-      new_features : (B, out_channel, npoint)
-      fps_inds     : (B, npoint) indices w.r.t input xyz of this layer
+    Keep YOUR original vector attention (phi/psi/delta/gamma/alpha) unchanged,
+    but add:
+      - distance decay bias on attention logits (DA-PAM)
+      - adaptive J per query based on valid ball neighbors m (AdaJ-PAM)
+        (implemented via mask over a fixed J_max)
     """
     def __init__(
         self,
@@ -118,10 +153,17 @@ class PAModuleVotes(nn.Module):
         in_channel: int,     # feature dim (excluding xyz)
         out_channel: int,
         hidden_dim: int = 64,
-        n_aug: int = 20,     # J in paper (augmented neighbors outside sphere)
+        n_aug: int = 20,     # J_max
         use_xyz: bool = True,
         normalize_xyz: bool = True,
         knn_chunk_size: int = 1024,
+
+        # --- Improvement #1: distance decay bias ---
+        use_dist_bias: bool = True,
+        dist_sigma_scale: float = 1.0,  # sigma = dist_sigma_scale * radius
+
+        # --- Improvement #2: adaptive J ---
+        adaptive_aug: bool = True,       # if False, use fixed J_max
     ):
         super().__init__()
         self.npoint = npoint
@@ -131,6 +173,10 @@ class PAModuleVotes(nn.Module):
         self.use_xyz = use_xyz
         self.normalize_xyz = normalize_xyz
         self.knn_chunk_size = knn_chunk_size
+
+        self.use_dist_bias = use_dist_bias
+        self.dist_sigma_scale = dist_sigma_scale
+        self.adaptive_aug = adaptive_aug
 
         full_in = in_channel + (3 if use_xyz else 0)
         self.full_in = full_in
@@ -185,6 +231,22 @@ class PAModuleVotes(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+    @torch.no_grad()
+    def _compute_adaptive_J(self, m: torch.Tensor) -> torch.Tensor:
+        """
+        m: (B,S) valid neighbor count inside the sphere
+        return J_i: (B,S) in [0, J_max]
+        Rule: J_i = round((1 - m/nsample) * J_max)
+        """
+        if (not self.adaptive_aug) or self.n_aug <= 0:
+            return torch.full_like(m, fill_value=int(self.n_aug), dtype=torch.long)
+
+        frac_missing = 1.0 - (m.float() / float(self.nsample))
+        frac_missing = torch.clamp(frac_missing, 0.0, 1.0)
+        J = torch.round(frac_missing * float(self.n_aug)).long()
+        J = torch.clamp(J, 0, int(self.n_aug))
+        return J
+
     def forward(self, xyz: torch.Tensor, features: torch.Tensor):
         """
         xyz:      (B, N, 3)
@@ -202,10 +264,16 @@ class PAModuleVotes(nn.Module):
             xyz.transpose(1, 2).contiguous(), fps_inds.int()
         ).transpose(1, 2).contiguous()  # (B, npoint, 3)
 
-        # -------- 2) Ball Query neighbors (inside sphere) --------
-        idx_ball = safe_ball_query(self.radius, self.nsample, xyz, new_xyz, knn_fallback_chunk=self.knn_chunk_size)  # (B,S,nsample)
+        # -------- 2) Ball Query neighbors (inside sphere) + valid mask --------
+        idx_ball, ball_valid = safe_ball_query_with_mask(
+            self.radius, self.nsample, xyz, new_xyz, knn_fallback_chunk=self.knn_chunk_size
+        )  # idx_ball: (B,S,nsample), ball_valid: (B,S,nsample)
 
-        # -------- 3) Augment neighbors (outside sphere): J = n_aug --------
+        # ball density proxy m
+        m = ball_valid.sum(-1)  # (B,S)
+        J_i = self._compute_adaptive_J(m)  # (B,S)
+
+        # -------- 3) Augment neighbors (outside sphere): pick J_max but mask by J_i --------
         if self.n_aug > 0:
             cand_k = max(self.nsample + self.n_aug, self.n_aug)
             idx_knn = knn_query(xyz, new_xyz, k=cand_k, chunk_size=self.knn_chunk_size)  # (B,S,cand_k)
@@ -213,32 +281,49 @@ class PAModuleVotes(nn.Module):
             xyz_trans = xyz.transpose(1, 2).contiguous()  # (B,3,N)
             knn_xyz = pointnet2_utils.grouping_operation(xyz_trans, idx_knn.int())  # (B,3,S,cand_k)
             rel_knn = knn_xyz - new_xyz.transpose(1, 2).contiguous().unsqueeze(-1)
-            dist2 = (rel_knn ** 2).sum(1)  # (B,S,cand_k)
+            dist2_knn = (rel_knn ** 2).sum(1)  # (B,S,cand_k)
 
             r2 = float(self.radius * self.radius) + 1e-6
-            dist2_masked = dist2.clone()
-            dist2_masked[dist2 <= r2] = float("inf")  # keep ONLY outside-sphere points
+            dist2_masked = dist2_knn.clone()
+            dist2_masked[dist2_masked <= r2] = float("inf")  # keep ONLY outside-sphere points
 
-            sel_dist2, sel = torch.topk(dist2_masked, k=self.n_aug, dim=-1, largest=False, sorted=True)  # (B,S,J)
-            idx_aug = idx_knn.gather(-1, sel)  # (B,S,J)
+            sel_dist2, sel = torch.topk(dist2_masked, k=self.n_aug, dim=-1, largest=False, sorted=True)  # (B,S,Jmax)
+            idx_aug = idx_knn.gather(-1, sel)  # (B,S,Jmax)
 
-            # if insufficient outside points (inf), fill with nearest overall
+            # aug_valid_base: those really outside & exist (not inf)
+            aug_valid = ~torch.isinf(sel_dist2)
+
+            # apply adaptive J mask: keep only first J_i points in rank order
+            # rank: 0..Jmax-1
+            rank = torch.arange(self.n_aug, device=xyz.device, dtype=torch.long)[None, None, :]  # (1,1,Jmax)
+            keep_by_J = rank < J_i.unsqueeze(-1)  # (B,S,Jmax)
+            aug_valid = aug_valid & keep_by_J
+
+            # for numerical stability: if some idx_aug invalid, still set idx value to something valid (won't be used due to mask)
             fill = idx_knn[..., :1].expand_as(idx_aug)
-            idx_aug = torch.where(torch.isinf(sel_dist2), fill, idx_aug).long()
+            idx_aug = torch.where(aug_valid, idx_aug, fill).long()
 
-            idx_all = torch.cat([idx_ball, idx_aug], dim=-1)  # (B,S,nsample+J)
+            idx_all = torch.cat([idx_ball, idx_aug], dim=-1)  # (B,S,nsample+Jmax)
+            valid_all = torch.cat([ball_valid, aug_valid], dim=-1)  # (B,S,nsample+Jmax)
         else:
-            idx_all = idx_ball  # (B,S,nsample)
+            idx_all = idx_ball
+            valid_all = ball_valid
 
         # -------- 4) Grouping xyz/features --------
         xyz_trans = xyz.transpose(1, 2).contiguous()  # (B,3,N)
         grouped_xyz = pointnet2_utils.grouping_operation(xyz_trans, idx_all.int())  # (B,3,S,K)
 
         center_xyz = new_xyz.transpose(1, 2).contiguous().unsqueeze(-1)  # (B,3,S,1)
-        relative_xyz = grouped_xyz - center_xyz  # (B,3,S,K)
+        rel_xyz = grouped_xyz - center_xyz  # (B,3,S,K)
 
+        # distances for dist-bias (use unnormalized distances)
+        dist2 = (rel_xyz ** 2).sum(1, keepdim=True)  # (B,1,S,K)
+
+        # normalized relative xyz for delta
         if self.normalize_xyz and self.radius > 0:
-            relative_xyz = relative_xyz / float(self.radius)
+            rel_xyz_for_delta = rel_xyz / float(self.radius)
+        else:
+            rel_xyz_for_delta = rel_xyz
 
         if features is not None:
             grouped_features = pointnet2_utils.grouping_operation(features, idx_all.int())  # (B,C,S,K)
@@ -247,13 +332,13 @@ class PAModuleVotes(nn.Module):
             grouped_features = None
             center_features = None
 
-        # Build x_j and x_i (feature vectors), consistent with PointNet++ use_xyz behavior
+        # Build x_j and x_i consistent with PointNet++ use_xyz
         if self.use_xyz:
             if grouped_features is None:
-                xj = relative_xyz  # (B,3,S,K)
+                xj = rel_xyz_for_delta  # (B,3,S,K)
                 xi = torch.zeros((B, 3, self.npoint, 1), device=xyz.device, dtype=xyz.dtype)  # (B,3,S,1)
             else:
-                xj = torch.cat([relative_xyz, grouped_features], dim=1)  # (B,3+C,S,K)
+                xj = torch.cat([rel_xyz_for_delta, grouped_features], dim=1)  # (B,3+C,S,K)
                 zeros = torch.zeros((B, 3, self.npoint, 1), device=xyz.device, dtype=xyz.dtype)
                 xi = torch.cat([zeros, center_features], dim=1)  # (B,3+C,S,1)
         else:
@@ -262,14 +347,26 @@ class PAModuleVotes(nn.Module):
             xj = grouped_features
             xi = center_features
 
-        # -------- 5) Vector Attention Aggregation --------
-        delta_h = self.delta_mlp(relative_xyz)  # (B,hidden,S,K)
+        # -------- 5) Vector Attention Aggregation (keep your original design) --------
+        delta_h = self.delta_mlp(rel_xyz_for_delta)  # (B,hidden,S,K)
 
         phi_x = self.phi(xi)                   # (B,hidden,S,1)
         psi_x = self.psi(xj)                   # (B,hidden,S,K)
 
         energy = phi_x - psi_x + delta_h       # (B,hidden,S,K)
         attn_logits = self.gamma(energy)       # (B,out,S,K)
+
+        # --- Improvement #1: distance decay bias (only extra bias term) ---
+        if self.use_dist_bias and self.radius > 0:
+            sigma = float(self.dist_sigma_scale * self.radius)
+            sigma2 = sigma * sigma + 1e-6
+            dist_bias = - dist2 / (2.0 * sigma2)  # (B,1,S,K)
+            attn_logits = attn_logits + dist_bias  # broadcast to (B,out,S,K)
+
+        # mask invalid neighbors (ball invalid + aug masked by adaptive J)
+        # set -inf so softmax ignores them
+        attn_logits = attn_logits.masked_fill(~valid_all.unsqueeze(1), float("-inf"))
+
         attn = F.softmax(attn_logits, dim=-1)  # (B,out,S,K)
 
         # alpha(x_j + delta)
@@ -279,67 +376,62 @@ class PAModuleVotes(nn.Module):
         new_features = torch.sum(attn * val, dim=-1)  # (B,out,S)
         new_features = self.out_mapper(new_features)  # (B,out,S)
 
-        return new_xyz, new_features, fps_inds
+        return new_xyz, new_features, fps_inds, m, J_i
 
 
 # -------------------------
-# Backbone: apply PAM to backbone_module.py
+# Backbone: apply PAM to SA1 only (keep rest unchanged)
 # -------------------------
 class Pointnet2Backbone(nn.Module):
     """
-    Backbone network for point cloud feature learning.
-    Based on PointNet++ SSG backbone, but replace SA1 with paper-style PAM
-    to reduce downsampling information loss (N -> 2048).
-
-    If you want to replace SA2-4 as well, you can swap them to PAModuleVotes similarly.
+    Replace SA1 with improved PAM (DA + AdaJ),
+    keep SA2-SA4 same as original for efficiency.
     """
     def __init__(self, input_feature_dim=0, pam_J: int = 20):
         super().__init__()
         self.input_feature_dim = input_feature_dim
 
-        # --------- SA1 replaced by PAM (critical stage) ---------
         self.sa1 = PAModuleVotes(
-            npoint=2048,
-            radius=0.2,
-            nsample=64,
-            in_channel=input_feature_dim,  # excluding xyz; PAM internally adds 3 if use_xyz=True
-            out_channel=128,
-            hidden_dim=64,
-            n_aug=pam_J,                   # J in paper (default 20)
-            use_xyz=True,
-            normalize_xyz=True,
-            knn_chunk_size=1024,
+            npoint=2048, radius=0.2, nsample=64,
+            in_channel=input_feature_dim, out_channel=128,
+            hidden_dim=64, n_aug=20,
+            use_xyz=True, normalize_xyz=True,
+            knn_chunk_size=2048,
+            use_dist_bias=True, dist_sigma_scale=1.0,
+            adaptive_aug=True
         )
 
-        # --------- keep SA2-SA4 as standard PointNet++ for efficiency ---------
-        self.sa2 = PointnetSAModuleVotes(
-            npoint=1024,
-            radius=0.4,
-            nsample=32,
-            mlp=[128, 128, 128, 256],
-            use_xyz=True,
-            normalize_xyz=True
+        self.sa2 = PAModuleVotes(
+            npoint=1024, radius=0.4, nsample=24,
+            in_channel=128, out_channel=256,
+            hidden_dim=64, n_aug=12,
+            use_xyz=True, normalize_xyz=True,
+            knn_chunk_size=2048,
+            use_dist_bias=True, dist_sigma_scale=1.0,
+            adaptive_aug=True
         )
 
-        self.sa3 = PointnetSAModuleVotes(
-            npoint=512,
-            radius=0.8,
-            nsample=16,
-            mlp=[256, 128, 128, 256],
-            use_xyz=True,
-            normalize_xyz=True
+        self.sa3 = PAModuleVotes(
+            npoint=512, radius=0.8, nsample=16,
+            in_channel=256, out_channel=256,
+            hidden_dim=64, n_aug=8,
+            use_xyz=True, normalize_xyz=True,
+            knn_chunk_size=2048,
+            use_dist_bias=True, dist_sigma_scale=1.2,
+            adaptive_aug=True
         )
 
-        self.sa4 = PointnetSAModuleVotes(
-            npoint=256,
-            radius=1.2,
-            nsample=16,
-            mlp=[256, 128, 128, 256],
-            use_xyz=True,
-            normalize_xyz=True
+        self.sa4 = PAModuleVotes(
+            npoint=256, radius=1.2, nsample=16,
+            in_channel=256, out_channel=256,
+            hidden_dim=64, n_aug=6,
+            use_xyz=True, normalize_xyz=True,
+            knn_chunk_size=2048,
+            use_dist_bias=True, dist_sigma_scale=1.2,
+            adaptive_aug=True
         )
 
-        # --------- FP layers ---------
+
         self.fp1 = PointnetFPModule(mlp=[256 + 256, 256, 256])
         self.fp2 = PointnetFPModule(mlp=[256 + 256, 256, 256])
 
@@ -352,48 +444,51 @@ class Pointnet2Backbone(nn.Module):
         pointcloud = data_dict["point_clouds"]
         xyz, features = self._break_up_pc(pointcloud)
 
-        # --------- SA1 (PAM) ---------
-        xyz, features, fps_inds = self.sa1(xyz, features)
-        data_dict["sa1_inds"] = fps_inds
-        data_dict["sa1_xyz"] = xyz
-        data_dict["sa1_features"] = features
+        # SA1 (PAM)
+        xyz1, feat1, sa1_inds, pam1_m, pam1_Ji = self.sa1(xyz, features)
+        data_dict["sa1_inds"] = sa1_inds
+        data_dict["sa1_xyz"] = xyz1
+        data_dict["sa1_features"] = feat1
 
-        # --------- SA2-SA4 (standard) ---------
-        xyz, features, fps_inds2 = self.sa2(xyz, features)
-        data_dict["sa2_inds"] = fps_inds2
-        data_dict["sa2_xyz"] = xyz
-        data_dict["sa2_features"] = features
+        # (optional) for visualization / analysis
+        # pam_m: (B,2048) ball valid count
+        # pam_Ji: (B,2048) adaptive J
+        data_dict["pam1_m"] = pam1_m
+        data_dict["pam1_Ji"] = pam1_Ji
 
-        xyz, features, _ = self.sa3(xyz, features)
-        data_dict["sa3_xyz"] = xyz
-        data_dict["sa3_features"] = features
+        # SA2-SA4 standard
+        # SA2 (PAM)
+        xyz2, feat2, sa2_inds, pam2_m, pam2_Ji = self.sa2(xyz1, feat1)
+        data_dict["sa2_inds"] = sa2_inds
+        data_dict["sa2_xyz"] = xyz2
+        data_dict["sa2_features"] = feat2
 
-        xyz, features, _ = self.sa4(xyz, features)
-        data_dict["sa4_xyz"] = xyz
-        data_dict["sa4_features"] = features
+        # SA3 (PAM)
+        xyz3, feat3, sa3_inds, pam3_m, pam3_Ji = self.sa3(xyz2, feat2)
+        data_dict["sa3_inds"] = sa3_inds
+        data_dict["sa3_xyz"] = xyz3
+        data_dict["sa3_features"] = feat3
 
-        # --------- FP layers ---------
-        features = self.fp1(
-            data_dict["sa3_xyz"], data_dict["sa4_xyz"],
-            data_dict["sa3_features"], data_dict["sa4_features"]
-        )
-        features = self.fp2(
-            data_dict["sa2_xyz"], data_dict["sa3_xyz"],
-            data_dict["sa2_features"], features
-        )
-        data_dict["fp2_features"] = features
-        data_dict["fp2_xyz"] = data_dict["sa2_xyz"]
+        # SA4 (PAM)
+        xyz4, feat4, sa4_inds, pam4_m, pam4_Ji = self.sa4(xyz3, feat3)
+        data_dict["sa4_inds"] = sa4_inds
+        data_dict["sa4_xyz"] = xyz4
+        data_dict["sa4_features"] = feat4
+        
+        # FP
+        fp1_features = self.fp1(xyz3, xyz4, feat3, feat4)
+        fp2_features = self.fp2(xyz2, xyz3, feat2, fp1_features)
 
-        # --------- Correct index mapping (1024 seeds -> original input indices) ---------
-        # sa1_inds: (B,2048) indices in [0, N-1]
-        # sa2_inds: (B,1024) indices in [0,2047] w.r.t SA1 output
+        data_dict["fp2_features"] = fp2_features
+        data_dict["fp2_xyz"] = xyz2
+
+        # Correct index mapping (1024 seeds -> original input indices)
         data_dict["fp2_inds"] = data_dict["sa1_inds"].gather(1, data_dict["sa2_inds"].long())
 
         return data_dict
 
 
 if __name__ == "__main__":
-    # Quick sanity test (shape only)
     backbone_net = Pointnet2Backbone(input_feature_dim=3, pam_J=20).cuda()
     backbone_net.eval()
     with torch.no_grad():

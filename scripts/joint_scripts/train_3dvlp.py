@@ -171,6 +171,10 @@ def get_solver(args, dataset, dataloader):
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         checkpoint_best = checkpoint["best"]
 
+        # 1月12日 测试剪枝
+        print(type(model.backbone_net.sa2), [n for n,_ in model.backbone_net.sa2.named_modules()][:30])
+        print(type(model.proposal.vote_aggregation), [n for n,_ in model.proposal.vote_aggregation.named_modules()][:30])
+
         # <--- 新增：读取保存的 epoch 并 +1 作为新的起始点
         if "epoch" in checkpoint:
             start_epoch = checkpoint["epoch"] + 1
