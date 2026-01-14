@@ -66,3 +66,6 @@ data_full_with_source.tar.gz
 # --- Add this to your .gitignore ---
 *.so
 *.o
+
+prune_viz_old/*
+prune_viz/*

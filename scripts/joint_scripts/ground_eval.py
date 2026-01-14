@@ -73,7 +73,33 @@ def get_model(args, DC, dataset):
 
     model_name = "model_last.pth" if args.detection else "model.pth"
     path = os.path.join(CONF.PATH.OUTPUT, args.folder, model_name)
-    model.load_state_dict(torch.load(path), strict=False)
+    # model.load_state_dict(torch.load(path), strict=False)
+    
+    ckpt = torch.load(path, map_location="cpu")
+
+    # 兼容：你保存的是 {"model_state_dict":..., "pruning_report":...}
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+        pruning_report = ckpt.get("pruning_report", None)
+    else:
+        # 老格式：纯 state_dict
+        state_dict = ckpt
+        pruning_report = None
+
+    # --- 关键：如果存在 pruning_report，先剪结构再加载 ---
+    if pruning_report is not None:
+        from lib.pruning.prune_utils import prune_backbone_only  # 你 pruning 脚本里的函数
+        prune_backbone_only(model, pruning_report)
+
+    # strip module. 前缀（如果有）
+    state_dict = { (k[7:] if k.startswith("module.") else k): v for k, v in state_dict.items() }
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print("missing:", len(missing), "unexpected:", len(unexpected))
+
+    print("missing:", len(missing))
+    print("unexpected:", len(unexpected))
+    print("unexpected sample:", unexpected[:20])
     model.eval()
 
     return model

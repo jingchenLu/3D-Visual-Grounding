@@ -2,7 +2,7 @@
 File Created: Monday, 25th November 2019 1:35:30 pm
 Author: Dave Zhenyu Chen (zhenyu.chen@tum.de)
 '''
-
+import torch.nn as nn
 import os
 import sys
 import time
@@ -27,6 +27,7 @@ from utils.box_util import box3d_diou_batch_tensor
 ITER_REPORT_TEMPLATE = """
 -------------------------------iter: [{epoch_id}: {iter_id}/{total_iter}]-------------------------------
 [loss] train_loss: {train_loss}
+[loss] train_sparse_loss: {train_sparse_loss}
 [loss] train_ref_loss: {train_ref_loss}
 [loss] train_con_loss: {train_con_loss}
 [loss] train_mlm_loss: {train_mlm_loss}
@@ -59,6 +60,7 @@ ITER_REPORT_TEMPLATE = """
 EPOCH_REPORT_TEMPLATE = """
 ---------------------------------summary---------------------------------
 [train] train_loss: {train_loss}
+[train] train_sparse_loss: {train_sparse_loss}
 [train] train_ref_loss: {train_ref_loss}
 [train] train_con_loss: {train_con_loss}
 [train] train_mlm_loss: {train_mlm_loss}
@@ -119,6 +121,26 @@ class Solver():
 
         self.model = model
         self.args = args
+        # ===== BN sparsity config =====
+        self.sparse_bn = getattr(args, "sparse_bn", False)
+        self.sparse_lambda_start = float(getattr(args, "sparse_lambda_start", 0.0))
+        self.sparse_lambda_end = float(getattr(args, "sparse_lambda_end", 0.0))
+        self.sparse_warmup_epochs = int(getattr(args, "sparse_warmup_epochs", 1))
+        self.sparse_start_epoch = int(getattr(args, "sparse_start_epoch", -1))  # -1: from resume start_epoch
+
+        def _parse_prefixes(s: str):
+            s = "" if s is None else str(s).strip()
+            if not s:
+                return None
+            arr = [p.strip() for p in s.split(",") if p.strip()]
+            return tuple(arr) if arr else None
+
+        self.sparse_bn_include = _parse_prefixes(getattr(args, "sparse_bn_include", ""))
+        self.sparse_bn_exclude = _parse_prefixes(getattr(args, "sparse_bn_exclude", ""))
+
+        # 在 __call__ 里根据 start_epoch 设置
+        self._sparse_base_epoch = 0
+
         self.device = device
         self.config = config
         self.dataset = dataset
@@ -272,6 +294,10 @@ class Solver():
             self.bn_scheduler = None
 
     def __call__(self, epoch, verbose, start_epoch=0):
+        if self.sparse_start_epoch < 0:
+            self._sparse_base_epoch = int(start_epoch)
+        else:
+            self._sparse_base_epoch = int(self.sparse_start_epoch)
         # setting
         self.epoch = epoch
         self.verbose = verbose
@@ -397,6 +423,7 @@ class Solver():
                 # loss (float, not torch.cuda.FloatTensor)
                 "loss": [],
                 "ref_loss": [],
+                "sparse_loss": [],
                 "con_loss": [],
                 "mlm_loss": [],
                 "lang_loss": [],
@@ -498,7 +525,7 @@ class Solver():
     def _dump_log(self, phase, is_eval=False, epoch_id=None):
         if phase == "train" and not is_eval:
             log = {
-                "loss": ["loss", "ref_loss", "lang_loss", "cap_loss", "ori_loss", "dist_loss", "objectness_loss", "vote_loss", "box_loss", "con_loss", "mlm_loss", "diou_loss"],
+                "loss": ["loss","sparse_loss", "ref_loss", "lang_loss", "cap_loss", "ori_loss", "dist_loss", "objectness_loss", "vote_loss", "box_loss", "con_loss", "mlm_loss", "diou_loss"],
                 "score": ["lang_acc", "ref_acc", "cap_acc", "ori_acc", "obj_acc", "pred_ious", "pos_ratio", "neg_ratio", "iou_rate_0.25", "iou_rate_0.5", "max_iou_rate_0.25", "max_iou_rate_0.5", "pred_iou_rate_0.25", "pred_iou_rate_0.5", "top_iou_rate_1", "top_iou_rate_2", "top_iou_rate_3", "top_iou_rate_4", "top_iou_rate_5", "top_ind"]
             }
             for i in range(18):
@@ -596,6 +623,48 @@ class Solver():
         self._running_log["loss"].backward()
         self.optimizer.step()
 
+    def _get_sparse_lambda(self, epoch_id: int) -> float:
+        if not self.sparse_bn:
+            return 0.0
+        if epoch_id < self._sparse_base_epoch:
+            return 0.0
+
+        warm = max(1, int(self.sparse_warmup_epochs))
+        t = (epoch_id - self._sparse_base_epoch + 1) / float(warm)
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+        return self.sparse_lambda_start + t * (self.sparse_lambda_end - self.sparse_lambda_start)
+
+    def _bn_gamma_l1(self) -> torch.Tensor:
+        """
+        mean(|gamma|) over selected BN layers (gamma = BN.weight).
+        用 mean 避免 lambda 随模型大小变化。
+        """
+        total = None
+        numel = 0
+
+        for name, m in self.model.named_modules():
+            if not isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                continue
+            if self.sparse_bn_include is not None and (not name.startswith(self.sparse_bn_include)):
+                continue
+            if self.sparse_bn_exclude is not None and name.startswith(self.sparse_bn_exclude):
+                continue
+            if m.weight is None:
+                continue
+
+            v = m.weight.abs().sum()
+            total = v if total is None else (total + v)
+            numel += m.weight.numel()
+
+        if total is None or numel == 0:
+            return torch.zeros((), device=self.device)
+
+        return total / float(numel)
+
+
     def _compute_loss(self, data_dict):
         data_dict = get_joint_loss(
             args=self.args,
@@ -613,8 +682,21 @@ class Solver():
             pad_token_id = self.tokenizer.pad_token_id,
             tokenizer=self.tokenizer
         )
+        # ===== BN-gamma sparsity (train only) =====
+        if self.sparse_bn and self.model.training:
+            epoch_id = int(data_dict.get("epoch", 0))  # 你循环里通常会 data_dict["epoch"]=epoch_id
+            lam = self._get_sparse_lambda(epoch_id)
+            if lam > 0:
+                sparse_loss = self._bn_gamma_l1()
+                data_dict["sparse_loss"] = sparse_loss
+                data_dict["loss"] = data_dict["loss"] + lam * sparse_loss
+            else:
+                data_dict["sparse_loss"] = torch.zeros((), device=self.device)
+        else:
+            data_dict["sparse_loss"] = torch.zeros((), device=self.device)
 
         # store loss
+        self._running_log["sparse_loss"] = data_dict["sparse_loss"]
         self._running_log["ref_loss"] = data_dict["ref_loss"]
         self._running_log["lang_loss"] = data_dict["lang_loss"]
         self._running_log["cap_loss"] = data_dict["cap_loss"]
@@ -872,6 +954,8 @@ class Solver():
                 # record log
                 self.log[phase]["loss"].append(
                     self._running_log["loss"].item())
+                self.log[phase]["sparse_loss"].append(
+                    self._running_log["sparse_loss"].item())
                 self.log[phase]["ref_loss"].append(
                     self._running_log["ref_loss"].item())
                 self.log[phase]["con_loss"].append(
@@ -1290,6 +1374,8 @@ class Solver():
             total_iter=self._total_iter["train"],
             train_loss=round(
                 np.mean([v for v in self.log["train"]["loss"]]), 5),
+            train_sparse_loss=round(
+                np.mean([v for v in self.log["train"]["sparse_loss"]]), 5),
             train_ref_loss=round(
                 np.mean([v for v in self.log["train"]["ref_loss"]]), 5),
             train_con_loss=round(
@@ -1364,6 +1450,8 @@ class Solver():
             # train_meteor=round(self.log["train"]["meteor"], 5),
             train_loss=round(
                 np.mean([v for v in self.log["train"]["loss"]]), 5),
+            train_sparse_loss=round(
+                np.mean([v for v in self.log["train"]["sparse_loss"]]), 5),
             train_ref_loss=round(
                 np.mean([v for v in self.log["train"]["ref_loss"]]), 5),
             train_con_loss=round(

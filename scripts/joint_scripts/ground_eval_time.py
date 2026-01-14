@@ -45,7 +45,7 @@ def get_dataloader(args, scanrefer, scanrefer_new, all_scene_list, split, config
         lang_num_max=args.lang_num_max
     )
     print("evaluate on {} samples".format(len(dataset)))
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
     return dataset, dataloader
 
 def get_model(args, DC, dataset):
@@ -69,7 +69,33 @@ def get_model(args, DC, dataset):
 
     model_name = "model_last.pth" if args.detection else "model.pth"
     path = os.path.join(CONF.PATH.OUTPUT, args.folder, model_name)
-    model.load_state_dict(torch.load(path), strict=False)
+    ckpt = torch.load(path, map_location="cpu")
+
+    # 兼容：你保存的是 {"model_state_dict":..., "pruning_report":...}
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+        pruning_report = ckpt.get("pruning_report", None)
+    else:
+        # 老格式：纯 state_dict
+        state_dict = ckpt
+        pruning_report = None
+
+    # --- 关键：如果存在 pruning_report，先剪结构再加载 ---
+    if pruning_report is not None:
+        from lib.pruning.prune_utils import prune_backbone_only  # 你 pruning 脚本里的函数
+        print("Pruning the backbone according to the pruning report...")
+        prune_backbone_only(model, pruning_report)
+
+    # strip module. 前缀（如果有）
+    state_dict = { (k[7:] if k.startswith("module.") else k): v for k, v in state_dict.items() }
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print("missing:", len(missing), "unexpected:", len(unexpected))
+
+    print("missing:", len(missing))
+    print("unexpected:", len(unexpected))
+    print("unexpected sample:", unexpected[:20])
+    
     model.eval()
     return model
 
@@ -145,9 +171,9 @@ def eval_ref(args):
     }
     
     # === 控制变量 ===
-    TARGET_SAMPLE_COUNT = 100  # 目标有效样本数
+    TARGET_SAMPLE_COUNT = 400  # 目标有效样本数
     valid_sample_count = 0    # 当前有效样本数 (不含预热)
-    warmup_steps = 5          # 预热 Batch 数
+    warmup_steps = 30          # 预热 Batch 数
     
     target_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 

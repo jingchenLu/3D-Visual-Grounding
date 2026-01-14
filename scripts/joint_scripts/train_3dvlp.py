@@ -171,10 +171,12 @@ def get_solver(args, dataset, dataloader):
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         checkpoint_best = checkpoint["best"]
 
-        # 1月12日 测试剪枝
-        print(type(model.backbone_net.sa2), [n for n,_ in model.backbone_net.sa2.named_modules()][:30])
-        print(type(model.proposal.vote_aggregation), [n for n,_ in model.proposal.vote_aggregation.named_modules()][:30])
-
+        # # 1月12日 各通道名称
+        # print(type(model.backbone_net.sa2), [n for n,_ in model.backbone_net.sa2.named_modules()][:30])
+        # print(type(model.proposal.vote_aggregation), [n for n,_ in model.proposal.vote_aggregation.named_modules()][:30])
+        # print([n for n,_ in model.proposal.vote_aggregation.named_modules()][:30])
+        # print([n for n,_ in model.vgen.named_modules()][:30])
+        
         # <--- 新增：读取保存的 epoch 并 +1 作为新的起始点
         if "epoch" in checkpoint:
             start_epoch = checkpoint["epoch"] + 1
@@ -962,6 +964,24 @@ if __name__ == "__main__":
     parser.add_argument("--minor_aug",
                         action="store_true",
                         help="augamation for minor label")
+    # 1月12 新增
+    # ===== BN-gamma sparsity (for slimming) =====
+    parser.add_argument("--sparse_bn", action="store_true",
+                        help="Enable BN-gamma L1 sparsity regularization.")
+    parser.add_argument("--sparse_lambda_start", type=float, default=0.0)
+    parser.add_argument("--sparse_lambda_end", type=float, default=5e-5)
+    parser.add_argument("--sparse_warmup_epochs", type=int, default=5)
+
+    # -1 表示“从本次 resume 的 start_epoch 开始稀疏”
+    parser.add_argument("--sparse_start_epoch", type=int, default=-1)
+
+    parser.add_argument("--sparse_bn_include", type=str,
+                        default="backbone_net,vgen,proposal,relation,match",
+                        help="Comma-separated prefixes to INCLUDE for BN sparsity.")
+    parser.add_argument("--sparse_bn_exclude", type=str,
+                        default="lang,caption,mlm,answer",
+                        help="Comma-separated prefixes to EXCLUDE for BN sparsity.")
+
 
     args = parser.parse_args()
 
