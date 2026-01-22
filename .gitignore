@@ -69,3 +69,7 @@ data_full_with_source.tar.gz
 
 prune_viz_old/*
 prune_viz/*
+
+scripts/vis/*
+
+pretrained/*

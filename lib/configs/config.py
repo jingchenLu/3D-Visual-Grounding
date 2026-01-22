@@ -68,7 +68,8 @@ CONF.PATH.GT_FEATURES = os.path.join(CONF.PATH.CLUSTER, "gt_{}_features") # data
 CONF.PATH.VOTENET_FEATURES = os.path.join(CONF.PATH.CLUSTER, "votenet_{}_predictions") # dataset
 
 # Bert
-CONF.BERT_TEXT_ENCODER = "bert-base-uncased"
+# CONF.BERT_TEXT_ENCODER = "bert-base-uncased"
+CONF.BERT_TEXT_ENCODER = os.path.join(CONF.PATH.PRETRAINED, "bert-base-uncased")
 CONF.BERT_CONFIG = 'lib/configs/config_bert.json'
 CONF.BERT_MAX_LEN = 50
 CONF.DISTILBERT_TEXT_ENCODER = "distilbert-base-uncased"
