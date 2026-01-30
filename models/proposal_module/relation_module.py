@@ -83,7 +83,7 @@ class RelationModule(nn.Module):
         head: int = 4,
         depth: int = 2,
         k_neighbors: int = None,      # 若为 None 或 >= num_proposals 则退化为全连接图
-
+        use_obj_embedding=True
     ):
         super().__init__()
         self.use_box_embedding = True
@@ -95,6 +95,7 @@ class RelationModule(nn.Module):
         self.head = head
         self.depth = depth
         self.k_neighbors = k_neighbors
+        self.use_obj_embedding = use_obj_embedding
 
         # 将 detection head 输出的 bbox feature 映射到 relation hidden space
         self.features_concat = nn.Sequential(

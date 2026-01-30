@@ -133,6 +133,9 @@ class JointNet(nn.Module):
             end_points: dict
         """
 
+        exec_times = {}
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        t_total_start = time.time()
         #######################################
         #                                     #
         #           DETECTION BRANCH          #
@@ -140,9 +143,18 @@ class JointNet(nn.Module):
         #######################################
 
         # --------- HOUGH VOTING ---------
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        t_start = time.time()
+
         data_dict = self.backbone_net(data_dict)
 
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        exec_times['pointnet_time'] = time.time() - t_start
+
         # --------- HOUGH VOTING ---------
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        t_start = time.time()
+
         xyz = data_dict["fp2_xyz"]
         features = data_dict["fp2_features"]
         data_dict["seed_inds"] = data_dict["fp2_inds"]
@@ -157,19 +169,34 @@ class JointNet(nn.Module):
 
         # --------- PROPOSAL GENERATION ---------
         data_dict = self.proposal(xyz, features, data_dict)
+
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        exec_times['voting_proposal_time'] = time.time() - t_start
         # --------- RELATION MODULE --------- 
+
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        t_start = time.time()
+
         data_dict = self.relation(data_dict)
 
-        # data_dict = self.gsa_after_relation(data_dict)  # <--- add this
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        exec_times['relation_time'] = time.time() - t_start
 
+
+        # 初始化 text_time 为 0，防止 no_reference 时报错
+        exec_times['text_time'] = 0.0
+        exec_times['fusion_time'] = 0.0
         if not self.no_reference:
             #######################################
             #                                     #
             #           LANGUAGE BRANCH           #
             #                                     #
             #######################################
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            t_start = time.time()
             data_dict = self.lang(data_dict)
-            
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            exec_times['text_time'] = time.time() - t_start
 
             #######################################
             #                                     #
@@ -204,6 +231,8 @@ class JointNet(nn.Module):
 
             # --------- PROPOSAL MATCHING ---------
             # config for bbox_embedding
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            t_start = time.time()
             data_dict = self.match(data_dict)
             #######################################
             #                                     #
@@ -212,6 +241,10 @@ class JointNet(nn.Module):
             #######################################
             if self.use_con:
                 data_dict = self.constrast(data_dict)
+
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            exec_times['fusion_time'] = time.time() - t_start
+            
 
         #######################################
         #                                     #
@@ -225,5 +258,11 @@ class JointNet(nn.Module):
         
         if self.use_answer:
             data_dict = self.answer(data_dict)
+
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        exec_times['total_time'] = time.time() - t_total_start
+
+        # 将时间字典存入 data_dict 返回
+        data_dict['exec_times'] = exec_times
 
         return data_dict

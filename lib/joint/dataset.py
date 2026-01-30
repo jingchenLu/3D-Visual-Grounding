@@ -599,12 +599,35 @@ class ScannetReferenceDataset(ReferenceDataset):
                               scene_id) + "_preprocess_{}.npy".format(self.split))
         pcl_color = np.load(os.path.join(CONF.PATH.SCANNET_DATA,
                                     scene_id) + "_pcl_color_{}.npy".format(self.split))
-        # print("2", time.time() - start)
+        xyz = point_cloud[:, 0:3]
+        normal = point_cloud[:, 3:6]
+        multiview = point_cloud[:, 6:6+128]
+
+
+        # 顺序为 xyz + rgb + normal + multiview （按开关选择）
+        feat_list = []
+        if self.use_color:
+            MEAN_COLOR_RGB = np.array([109.8, 97.2, 83.8], dtype=np.float32)
+            rgb = (pcl_color - MEAN_COLOR_RGB) / 256.0
+            feat_list.append(rgb)
+
+        if self.use_normal:
+            feat_list.append(normal)
+
+        if self.use_multiview:
+            feat_list.append(multiview)
+
+        if len(feat_list) > 0:
+            point_cloud = np.concatenate([xyz] + feat_list, axis=1)
+        else:
+            point_cloud = xyz
+
+        # height appended at the end (optional)
         if self.use_height:
-            floor_height = np.percentile(point_cloud[:, 2], 0.99)
-            height = point_cloud[:, 2] - floor_height
-            point_cloud = np.concatenate(
-                [point_cloud, np.expand_dims(height, 1)], 1)
+            floor_height = np.percentile(xyz[:, 2], 0.99)
+            height = (xyz[:, 2] - floor_height).reshape(-1, 1).astype(np.float32)
+            point_cloud = np.concatenate([point_cloud, height], axis=1)
+        
         # print("3", time.time() - start)
         replace = (point_cloud.shape[0]<self.num_points)
         choices = self.rng.choice(
@@ -613,6 +636,7 @@ class ScannetReferenceDataset(ReferenceDataset):
         instance_labels = instance_labels[choices]
         semantic_labels = semantic_labels[choices]
         pcl_color = pcl_color[choices]
+
         # print("4", time.time() - start)
         # ------------------------------- GROUND TRUTH ------------------------------
         # ground truth boxes
