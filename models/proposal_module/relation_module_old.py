@@ -7,15 +7,15 @@ import random
 
 
 class RelationModule(nn.Module):
-    def __init__(self, num_proposals=256, hidden_size=128, lang_num_size=300, det_channel=128, head=4, depth=2):
+    def __init__(self, num_proposals=256, hidden_size=128, lang_num_size=300, det_channel=128, head=4, depth=2, use_obj_embedding=True):
         super().__init__()
         self.use_box_embedding = True
         self.use_dist_weight_matrix = True
-        self.use_obj_embedding = True
 
         self.num_proposals = num_proposals
         self.hidden_size = hidden_size
         self.depth = depth
+        self.use_obj_embedding = use_obj_embedding
 
         self.features_concat = nn.Sequential(
             nn.Conv1d(det_channel, hidden_size, 1),

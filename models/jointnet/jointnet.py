@@ -6,6 +6,7 @@ import sys
 import os
 import time
 from models.base_module.backbone_module import Pointnet2Backbone
+from models.base_module.backbone_module_old import Pointnet2Backbone as OldPointnet2Backbone
 from models.base_module.voting_module import VotingModule
 from models.lang_bert_module.lang_bert_module import LangBertModule
 from models.proposal_module.proposal_module_fcos import ProposalModule
@@ -29,7 +30,8 @@ class JointNet(nn.Module):
                  no_caption=False, use_topdown=False, query_mode="corner", num_graph_steps=0, use_relation=False,
                  use_lang_classifier=True, use_bidir=False, no_reference=False,
                  emb_size=768, ground_hidden_size=256, caption_hidden_size=512, dataset_config=None, use_con=False, use_distil=False, unfreeze=6, use_mlm=False,
-                 use_lang_emb=False, mask_box=False, use_pc_encoder=False, use_match_con_loss=False, use_reg_head=False, use_kl_loss=False, use_answer=False,num_answers=0,use_mlcv_net=False,use_vote_weight=False):
+                 use_lang_emb=False, mask_box=False, use_pc_encoder=False, use_match_con_loss=False, use_reg_head=False, use_kl_loss=False, use_answer=False,num_answers=0,use_mlcv_net=False,use_vote_weight=False,
+                 relation_type="new"):
         super().__init__()
 
         self.num_class = num_class
@@ -59,6 +61,13 @@ class JointNet(nn.Module):
         self.use_answer = use_answer
         self.use_mlcv_net = use_mlcv_net
         self.use_vote_weight = use_vote_weight
+        # 对比relation模块
+        self.relation_type = relation_type
+
+        if self.relation_type == "old":
+            from models.proposal_module.relation_module_old import RelationModule as RelationModuleImpl
+        else:
+            from models.proposal_module.relation_module import RelationModule as RelationModuleImpl
 
         # --------- PROPOSAL GENERATION ---------
         if self.use_mlcv_net:
@@ -70,8 +79,12 @@ class JointNet(nn.Module):
             self.vgen = MLCVVotingModule(self.vote_factor, 256)
         else:
             # Backbone point feature learning
-            self.backbone_net = Pointnet2Backbone(
-                input_feature_dim=self.input_feature_dim)
+            if self.relation_type == "old":
+                self.backbone_net = OldPointnet2Backbone(
+                    input_feature_dim=self.input_feature_dim)
+            else:
+                self.backbone_net = Pointnet2Backbone(
+                    input_feature_dim=self.input_feature_dim)
 
             # Hough voting
             self.vgen = VotingModule(self.vote_factor, 256)
@@ -80,7 +93,7 @@ class JointNet(nn.Module):
         self.proposal = ProposalModule(
             num_class, num_heading_bin, num_size_cluster, mean_size_arr, num_proposal, sampling, mask_box=self.mask_box, use_kl_loss=self.use_kl_loss,use_vote_weight=self.use_vote_weight)
 
-        self.relation = RelationModule(
+        self.relation = RelationModuleImpl(
             num_proposals=num_proposal, det_channel=128, use_obj_embedding=(self.input_feature_dim >= 128))  # bef 256
         
         

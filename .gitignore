@@ -23,9 +23,12 @@ utils/__pycache__
 lib/pointnet2/build/
 lib/pointnet2/dist/
 lib/pointnet2/pointnet2.egg-info/
-
+ss
 # output
-outputs/
+outputs/*
+
+# 应用
+scripts/3d-react/captures/*
 
 # delete
 docs/.DS_Store

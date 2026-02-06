@@ -195,36 +195,11 @@ class MatchModule(nn.Module):
 
         # cross-attention
         # 应用多层交叉注意力机制，将语言特征作为key和value，视觉特征作为query
-        # cross-attention (store attn weights for visualization)
-        attn_list = []  # each: (B*L, heads, num_proposal, num_tokens)
-
         for i in range(self.depth):
-            out = self.grounding_cross_attn[i](feature1, lang_fea, lang_fea, return_attn=True)
-            # compatible: decoder may return (x, attn) or dict
-            if isinstance(out, (tuple, list)) and len(out) == 2:
-                feature1, attn = out
-            elif isinstance(out, dict) and ("x" in out) and ("attn" in out):
-                feature1, attn = out["x"], out["attn"]
-            else:
-                # fallback: no attn provided
-                feature1, attn = out, None
-
-            if attn is not None:
-                attn_list.append(attn.detach())
-
+            feature1 = self.grounding_cross_attn[i](
+                feature1, lang_fea, lang_fea)  # (B*lang_num_max, 256, hidden)
         data_dict["cross_box_feature"] = feature1
-        if len(attn_list) > 0:
-            data_dict["cross_attn_weights"] = attn_list
-
-            attn_last = attn_list[-1]                 # (B*L, H, Q, T)
-            data_dict["cross_attn_last"] = attn_last  # 直接存一份
-
-            attn_qt = attn_last.mean(1)               # (B*L, Q, T)
-            data_dict["cross_attn_map_tokenwise"] = attn_qt
-
-            attn_map = attn_qt.max(-1)[0]             # (B*L, Q)
-            data_dict["cross_attn_map"] = attn_map
-
+        
         # match
         feature1_agg = feature1
         feature1_agg = feature1_agg.view(

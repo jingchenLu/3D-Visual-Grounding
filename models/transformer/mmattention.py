@@ -65,7 +65,7 @@ class CrossAttentionDecoderLayer(nn.Module):
         self.dropout = nn.Dropout(p=drop_prob)
         self.head = head
 
-    def forward(self, query, key, value, src_mask=None, src_trg_mask=None):
+    def forward(self, query, key, value, src_mask=None, src_trg_mask=None, return_attn=False):
         # 1. compute self attention
         # 2. add and norm
         _x = query
@@ -74,7 +74,14 @@ class CrossAttentionDecoderLayer(nn.Module):
         # 3. compute encoder - decoder attention
         # 4. add and norm
         _x = x
-        x = self.enc_dec_attention(x, key, value, attention_mask=src_trg_mask)
+        if return_attn:
+            x, attn = self.enc_dec_attention(
+                x, key, value, attention_mask=src_trg_mask, output_attn=True
+            )  # attn: (B, head, Q, T)
+            self.last_cross_attn = attn.detach()
+        else:
+            x = self.enc_dec_attention(x, key, value, attention_mask=src_trg_mask)
+            attn = None
 
         # 5. positionwise feed forward network
         _x = x
@@ -83,4 +90,6 @@ class CrossAttentionDecoderLayer(nn.Module):
         # 6. add and norm
         x = self.dropout(x)
         x = self.norm(x + _x)
+        if return_attn:
+            return x, attn
         return x

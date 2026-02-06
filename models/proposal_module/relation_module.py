@@ -7,43 +7,6 @@ import random
 from models.jointnet.gsa_module import GlobalBiasGSA
 from models.jointnet.object_gsa_module import ObjectnessAwareGSA
 
-# [NEW] 门控残差融合：默认 alpha=0，训练初期几乎不影响原模型
-# class RelGlobalFusion(nn.Module):
-#     def __init__(self, hidden_size: int, init_alpha: float = 0.0):
-#         super().__init__()
-#         self.gate = nn.Sequential(
-#             nn.Linear(hidden_size * 2, hidden_size),
-#             nn.ReLU(inplace=True),
-#             nn.Linear(hidden_size, hidden_size),
-#             nn.Sigmoid()
-#         )
-#         self.alpha = nn.Parameter(torch.ones(1, 1, hidden_size) * init_alpha)  # (1,1,C)
-
-#     def forward(self, rel_feat: torch.Tensor, gsa_feat: torch.Tensor):
-#             """
-#             Args:
-#                 rel_feat: (B, N, C) 来自 Relation Module 的特征
-#                 gsa_feat: (B, N, C) 来自 GSA Module 的特征
-#             Returns:
-#                 out: (B, N, C) 融合后的特征
-#                 gate_mean: scalar tensor, 当前 batch 的平均融合权重 (用于监控)
-#             """
-#             # 1. 计算门控值 (B, N, C) ~ [0, 1]
-#             concat_feat = torch.cat([rel_feat, gsa_feat], dim=-1)
-#             gate_val = self.gate(concat_feat)
-            
-#             # 2. 计算实际融合权重 (B, N, C)
-#             # alpha 控制整体强度，gate 控制局部选择
-#             fusion_weight = self.alpha * gate_val 
-            
-#             # 3. 残差融合
-#             # 公式: Out = Rel + Weight * (GSA - Rel)
-#             # 等价于: Out = (1 - Weight) * Rel + Weight * GSA
-#             out = rel_feat + fusion_weight * (gsa_feat - rel_feat)
-            
-#             # 4. 返回特征 + 权重的均值 (用于 TensorBoard 监控)
-#             return out, fusion_weight.mean()
-
 
 class FusionConcatDelta(nn.Module):
     def __init__(self, c=128, hidden=256, init_scale=0.1, dropout=0.1):
@@ -88,7 +51,6 @@ class RelationModule(nn.Module):
         super().__init__()
         self.use_box_embedding = True
         self.use_dist_weight_matrix = True
-        self.use_obj_embedding = True
 
         self.num_proposals = num_proposals
         self.hidden_size = hidden_size
@@ -139,20 +101,6 @@ class RelationModule(nn.Module):
         self.obj_embedding = nn.ModuleList(
             nn.Linear(128, hidden_size) for _ in range(depth)
         )
-
-        # # # GSA after relation (scene_in_dim usually 256 from fp2/seed_features)
-        # self.gsa_branch = GlobalBiasGSA(
-        #     d_model=128,
-        #     nhead=4,
-        #     depth=1,
-        #     scene_in_dim=256,   # 这里务必与你 data_dict["seed_features"] 的 channel 对齐
-        #     d_ff=256,
-        #     dropout=0.1,
-        #     top_scene_k=None
-        # )
-
-        # # [NEW] 并行融合器：不改变你原 relation 的内部结构，只在末尾融合
-        # self.rel_global_fusion = RelGlobalFusion(hidden_size=hidden_size, init_alpha=0.0)
 
         self.gsa_branch = ObjectnessAwareGSA(hidden_size=hidden_size)
 
@@ -237,9 +185,6 @@ class RelationModule(nn.Module):
 
         corners = data_dict["pred_bbox_corner"]                        # (B, N, 8, 3)
         centers = self._get_bbox_centers(corners)                      # (B, N, 3)
-
-        # 备份原始特征用于 GSA
-        features_for_gsa = features.clone()
 
         # 2) 构造几何特征 & 可选 kNN mask
         if self.use_dist_weight_matrix:
@@ -326,30 +271,6 @@ class RelationModule(nn.Module):
                 attention_weights=dist_weights,
                 way=attention_matrix_way
             )
-
-        # [NEW] 并行 GSA + 融合（不改你原 relation 主干输出，只在末尾融合）
-        # 更清晰的 epoch 处理：None 表示 data_dict 没提供 epoch => 不 warmup，直接启用
-        # epoch = data_dict.get("epoch", None)
-        # use_gsa = (epoch is None) or (int(epoch) >= int(self.gsa_warmup_epochs))
-
-        # # 默认监控值
-        # gsa_gate_mean = torch.tensor(0.0).to(features.device)
-
-        # if use_gsa:
-        #     # 准备输入
-        #     gsa_input = dict(data_dict)
-        #     gsa_input["bbox_feature"] = features_for_gsa # 使用原始特征
-            
-        #     # [关键] 必须确保 data_dict 里有 objectness_scores
-        #     # 你的 MatchModule 用到了它，说明它一定在 data_dict 里
-            
-        #     # 调用 GSA
-        #     gsa_out = self.gsa_branch(gsa_input)
-        #     gsa_feat = gsa_out["gsa_feature"] # (B, N, C)
-
-        #     # 融合 (Relation Output + Global Context)
-        #     features, gsa_gate_mean = self.rel_global_fusion(features, gsa_feat)
-            
 
         data_dict["dist_weights"] = dist_weights
         data_dict["attention_matrix_way"] = attention_matrix_way

@@ -18,20 +18,20 @@ from plyfile import PlyData, PlyElement
 sys.path.append(os.path.join(os.getcwd())) # HACK add the root folder
 from utils.pc_utils import write_ply_rgb, write_oriented_bbox
 from utils.box_util import get_3d_box, box3d_iou
+
 from models.jointnet.jointnet import JointNet
 from data.scannet.model_util_scannet import ScannetDatasetConfig
-from lib.joint.dataset2 import ScannetReferenceDataset
-from lib.joint.solver2 import Solver
-from lib.ap_helper4 import APCalculator, parse_predictions, parse_groundtruths
-from lib.loss_helper.loss_joint2 import get_joint_loss
-from lib.config_joint import CONF
+from lib.joint.dataset import ScannetReferenceDataset
+from lib.ap_helper.ap_helper_fcos import  parse_predictions
+from lib.loss_helper.loss_joint import get_joint_loss
+from lib.configs.config import CONF
 from scripts.core_vision_utils import save_bbox_heatmap
 
 from crash_on_ipy import *
 # data
 #SCANNET_ROOT = "/mnt/canis/Datasets/ScanNet/public/v2/scans/" # TODO point this to your scannet data
 #SCANNET_ROOT = "/data4/caidaigang/caidaigang/model/scanrefer/data/scannet/scans/"  #29
-SCANNET_ROOT = "/data5/caidaigang/scanrefer/data/scannet/scans/"  #30
+SCANNET_ROOT = "/home/ljc/work/3DVLP/data/scannet/scans/"  #30
 SCANNET_MESH = os.path.join(SCANNET_ROOT, "{}/{}_vh_clean_2.ply") # scene_id, scene_id
 SCANNET_META = os.path.join(SCANNET_ROOT, "{}/{}.txt") # scene_id, scene_id
 SCANREFER_TRAIN = json.load(open(os.path.join(CONF.PATH.DATA, "ScanRefer_filtered_train.json")))
@@ -498,6 +498,8 @@ def visualize(args):
         data = model(data)
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         data = get_joint_loss(
+            args=args,
+            pad_token_id=0,
             data_dict=data,
             device=device,
             config=DC,
@@ -540,7 +542,29 @@ if __name__ == "__main__":
     parser.add_argument('--use_color', action='store_true', help='Use RGB color in input.')
     parser.add_argument('--use_normal', action='store_true', help='Use RGB color in input.')
     parser.add_argument('--use_multiview', action='store_true', help='Use multiview images.')
+    
+        # ================= 补充缺失的关键参数 (从 ground_visualize 迁移) =================
+    parser.add_argument("--lang_num_max", type=int, help="lang num max", default=32)
+    parser.add_argument("--seed", type=int, default=42, help="random seed")
+    parser.add_argument("--repeat", type=int, default=1, help="Number of times for evaluation")
+    parser.add_argument("--force", action="store_true", help="enforce the generation of results")
+    parser.add_argument("--no_lang_cls", action="store_true", help="Do NOT use language classifier.")
+    parser.add_argument("--use_bidir", action="store_true", help="Use bi-directional GRU.")
+    parser.add_argument("--use_con", action="store_true", help="Use contrastive losses / contrast module.")
+    parser.add_argument("--use_diou_loss", action="store_true", help="Use DIOU loss in grounding/detection.")
+    parser.add_argument("--use_oracle", action="store_true", help="Use ground truth bounding boxes.")
+    parser.add_argument("--use_cat_rand", action="store_true", help="Use randomly selected bounding boxes from correct categories as outputs.")
+    parser.add_argument("--use_best", action="store_true", help="Use best bounding boxes as outputs.")
+    parser.add_argument("--reference", action="store_true", help="evaluate the reference localization results")
+    parser.add_argument("--detection", action="store_true", help="evaluate the object detection results")
+
     args = parser.parse_args()
+
+    # ================= 关键补全：初始化隐式参数 =================
+    for _flag in ["use_reg_head", "use_kl_loss", "use_attr_loss",
+                  "use_vote_weight", "use_answer", "use_mlm", "debug"]:
+        if not hasattr(args, _flag):
+            setattr(args, _flag, False)
 
     # # setting
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
